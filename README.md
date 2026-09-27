@@ -1,5 +1,7 @@
 # BrowserSkill
 
+> **This fork adds Safari support.** See [`apps/extension-safari/README.md`](apps/extension-safari/README.md) for the Safari extension, a small daemon patch (branch `safari-support`), and everything upstream doesn't cover. Everything else below is Tencent's original, for Chrome/Edge.
+
 <p align="center">
   <img src="docs/assets/browserskill-readme-banner.png" alt="BrowserSkill — connect your AI agent to your browser" />
 </p>

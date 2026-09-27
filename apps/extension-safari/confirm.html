@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Allow BrowserSkill to borrow this tab?</title>
+<style>
+  body { font: 14px -apple-system, sans-serif; margin: 0; padding: 16px; color: CanvasText; background: Canvas; }
+  p { margin: 0 0 12px; }
+  .tab { font-weight: 600; }
+  .url { color: GrayText; font-size: 12px; word-break: break-all; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; }
+  button { flex: 1; padding: 8px; font: inherit; }
+</style>
+<p>An agent wants to control this tab:</p>
+<p class="tab" id="title"></p>
+<p class="url" id="url"></p>
+<div class="row">
+  <button id="deny">Deny</button>
+  <button id="allow" autofocus>Allow</button>
+</div>
+<script src="confirm.js"></script>

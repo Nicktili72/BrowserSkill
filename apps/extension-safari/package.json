@@ -1,0 +1,8 @@
+{
+  "name": "extension-safari",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BrowserSkill extension for Safari — plain JS, no build step.",
+  "type": "commonjs",
+  "scripts": { "test": "node --test test/" }
+}
