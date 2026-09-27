@@ -47,13 +47,31 @@ pub(super) fn origin_allowed(origin: &str, allow_any: bool) -> bool {
         return true;
     }
     // MV3 extension ids are 32 a–p characters per Chrome spec.
-    let prefix = "chrome-extension://";
-    if let Some(rest) = origin.strip_prefix(prefix) {
+    let chrome_prefix = "chrome-extension://";
+    if let Some(rest) = origin.strip_prefix(chrome_prefix) {
         if rest.len() == 32 && rest.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
             return true;
         }
     }
+    // Safari Web Extension background pages report their origin as
+    // `safari-web-extension://<UUID>`, lowercase, 8-4-4-4-12 hex groups.
+    let safari_prefix = "safari-web-extension://";
+    if let Some(rest) = origin.strip_prefix(safari_prefix) {
+        if is_lowercase_uuid(rest) {
+            return true;
+        }
+    }
     false
+}
+
+fn is_lowercase_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    let lens = [8, 4, 4, 4, 12];
+    groups.len() == lens.len()
+        && groups
+            .iter()
+            .zip(lens)
+            .all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
 }
 
 pub struct WsServer {
@@ -138,7 +156,7 @@ async fn handle_connection(
         if !origin_allowed(&origin, allow_any) {
             warn!(?origin, "rejecting WS upgrade with disallowed origin");
             let mut err = ErrorResponse::new(Some(
-                "Origin not in chrome-extension allow-list".to_string(),
+                "Origin not in chrome-extension/safari-web-extension allow-list".to_string(),
             ));
             *err.status_mut() = StatusCode::FORBIDDEN;
             return Err(err);
@@ -737,6 +755,28 @@ mod tests {
     #[test]
     fn origin_allowlist_bypassed_when_allow_any() {
         assert!(origin_allowed("http://localhost", true));
+    }
+
+    #[test]
+    fn origin_allowlist_accepts_safari_web_extension_uuid() {
+        assert!(origin_allowed(
+            "safari-web-extension://3610fd31-0161-4c6b-919a-ee9a3edb2c19",
+            false
+        ));
+    }
+
+    #[test]
+    fn origin_allowlist_rejects_safari_uppercase_uuid() {
+        assert!(!origin_allowed(
+            "safari-web-extension://3610FD31-0161-4C6B-919A-EE9A3EDB2C19",
+            false
+        ));
+    }
+
+    #[test]
+    fn origin_allowlist_rejects_safari_malformed_uuid() {
+        assert!(!origin_allowed("safari-web-extension://not-a-uuid", false));
+        assert!(!origin_allowed("safari-web-extension://", false));
     }
 }
 
