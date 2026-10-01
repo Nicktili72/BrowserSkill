@@ -23,8 +23,11 @@ rm -rf "$WRAPPER_DIR"
 
 echo "=== Building ==="
 cd "$WRAPPER_DIR/BrowserSkill for Safari"
+# ENABLE_OUTGOING_NETWORK_CONNECTIONS adds com.apple.security.network.client
+# to the sandboxed appex; without it every WebSocket to the daemon fails
+# silently (WKWebExtensionContextErrorDomain code 7 in the Safari log).
 xcodebuild -project "BrowserSkill for Safari.xcodeproj" -scheme "BrowserSkill for Safari" \
-  -configuration Debug -derivedDataPath ../build build
+  -configuration Debug -derivedDataPath ../build ENABLE_OUTGOING_NETWORK_CONNECTIONS=YES build
 
 APP="../build/Build/Products/Debug/BrowserSkill for Safari.app"
 echo "=== Built: $APP ==="
