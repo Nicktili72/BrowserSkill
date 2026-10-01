@@ -39,10 +39,31 @@ const KEY_CODES = {
   End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
 };
 function keyToCode(key) {
+  if (key === 'Control' || key === 'Alt' || key === 'Meta' || key === 'Shift') return key + 'Left';
   if (KEY_CODES[key]) return KEY_CODES[key];
+  // Combos like 'Control+a': the real `code` is the MAIN key ('KeyA'), and
+  // the prefix names the modifier(s). Without this the whole combo string
+  // leaked through as a junk `code`.
+  const plus = key.lastIndexOf('+');
+  if (plus > 0) {
+    const mods = key.slice(0, plus).split('+');
+    const main = key.slice(plus + 1);
+    if (mods.every((m) => m === 'Control' || m === 'Alt' || m === 'Meta' || m === 'Shift') && main) return keyToCode(main);
+  }
   if (/^[a-zA-Z]$/.test(key)) return 'Key' + key.toUpperCase();
   if (/^[0-9]$/.test(key)) return 'Digit' + key;
   return key;
+}
+
+// 'Control+Alt+Delete' -> ['Control','Alt'] (empty when `key` has no
+// modifier prefix). These go out in tool.press's `modifiers` wire field.
+function keyToModifiers(key) {
+  const plus = key.lastIndexOf('+');
+  if (plus <= 0) return [];
+  const mods = key.slice(0, plus).split('+');
+  return mods.every((m) => m === 'Control' || m === 'Alt' || m === 'Meta' || m === 'Shift') && key.slice(plus + 1)
+    ? mods
+    : [];
 }
 
 function rpcOk(id, result) {
@@ -55,7 +76,7 @@ function rpcErr(id, code, message, data) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { PROTOCOL_VERSION, MIN_COMPATIBLE_PROTOCOL, handshakeParams, NO_DIALOGS, keyToCode, rpcOk, rpcErr };
+  module.exports = { PROTOCOL_VERSION, MIN_COMPATIBLE_PROTOCOL, handshakeParams, NO_DIALOGS, keyToCode, keyToModifiers, rpcOk, rpcErr };
 } else {
   // manifest.json loads this as a separate classic script from
   // background.js: `const`/`let` top-level bindings do NOT become

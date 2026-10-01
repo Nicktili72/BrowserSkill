@@ -46,9 +46,13 @@
   }
 
   // Resolves {ref, selector} to one element, or throws {code, message}.
+  // A leading '@' is stripped so '@e1' and 'e1' both resolve — this matches
+  // upstream's ref-store normaliseRef() and is why @e1 stays in the snapshot
+  // format and in tool schemas (see NOTES.md).
   function resolve({ ref, selector }) {
     if (ref) {
-      const el = refs.get(ref);
+      const key = ref.replace(/^@/, '');
+      const el = refs.get(key);
       if (!el || !el.isConnected) throw { code: 'not_found', message: `ref ${ref} not found; call snapshot again` };
       return { el, usedRef: ref, usedSelector: undefined };
     }
@@ -98,10 +102,28 @@
       let usedRef, usedSelector;
       if (m.ref || m.selector) ({ el, usedRef, usedSelector } = resolve(m));
       el.focus?.();
-      for (const t of ['keydown', 'keypress', 'keyup']) {
-        el.dispatchEvent(new KeyboardEvent(t, { key: m.key, code: m.code, bubbles: true, cancelable: true }));
+      // m.modifiers arrives as ['Control','Alt','Shift','Meta'] subsets —
+      // mapped to the KeyboardEvent booleans (and echoed back as `code`s by
+      // background.js). No modifier = exactly the old behaviour.
+      const mods = m.modifiers || [];
+      const hasMod = (n) => mods.includes(n);
+      // Enter on a form field: submit the form ONCE, via requestSubmit, and
+      // skip the synthetic event dispatch entirely — page JS that listens for
+      // Enter-keydown would otherwise fire, so the submit would happen twice.
+      // Untrusted synthetic keydown does NOT trigger native Enter-submit on
+      // its own; without this branch, JS-submitting pages got requestSubmit
+      // as a second submit. See NOTES.md.
+      const submitOnEnter = m.key === 'Enter' && el.form && !hasMod('Control') && !hasMod('Alt') && !hasMod('Meta');
+      if (!submitOnEnter) {
+        for (const t of ['keydown', 'keypress', 'keyup']) {
+          el.dispatchEvent(new KeyboardEvent(t, {
+            key: m.key, code: m.code, bubbles: true, cancelable: true,
+            ctrlKey: hasMod('Control'), altKey: hasMod('Alt'), metaKey: hasMod('Meta'),
+          }));
+        }
+      } else {
+        el.form.requestSubmit(el.form.querySelector('[type=submit],button:not([type])') || undefined);
       }
-      if (m.key === 'Enter' && el.form) el.form.requestSubmit(el.form.querySelector('[type=submit],button:not([type])') || undefined);
       return { usedRef, usedSelector };
     },
     scrollTo: (m) => {

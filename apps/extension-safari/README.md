@@ -2,13 +2,17 @@
 
 Lets `bsk` (BrowserSkill's own CLI + daemon, unmodified in spirit) drive **Safari**, the same way the upstream extension drives Chrome/Edge — so Hermes Agent, Claude Code, Cursor, Codex, or any other `bsk`-aware agent harness can automate Safari too.
 
-This is a from-scratch Safari extension speaking `bsk`'s real wire protocol (`bsk-protocol`), not a bridge process and not a separate tool. One small patch to the daemon (`crates/bsk-cli/src/daemon/ws.rs`, branch `safari-support`) is the only change to the Rust side.
+This is a from-scratch Safari extension speaking `bsk`'s real wire protocol (`bsk-protocol`), not a bridge process and not a separate tool.
+
+This repo is just the extension — it doesn't carry BrowserSkill's own (large) source tree. `bsk` itself needs one small patch to its daemon before it will accept a Safari connection at all (it only recognizes `chrome-extension://` origins otherwise); that patch is [`daemon-origin-patch.diff`](daemon-origin-patch.diff) in this repo. Either:
+- clone [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill), apply `daemon-origin-patch.diff`, and `cargo build -p bsk`, or
+- use the [full fork](https://github.com/Nicktili72/BrowserSkill/tree/safari-support) (branch `safari-support`), which already has it applied and also contains this same extension under `apps/extension-safari/`.
 
 ## Status
 
 **Working end-to-end**, verified against a real `bsk daemon` and real Safari: `session start/stop`, `tab_list/create/close/select/borrow/return`, `navigate`, `snapshot`, `click`, `fill`, `press`, `scroll_to`, `screenshot`. Anything else in `bsk-protocol`'s `Method` enum (upload, download, network, console, debug, record, evaluate, hover, wheel, focus/blur, select, get_html, observe, wait_*, request_help) returns a clean `unsupported` RPC error rather than silently no-op'ing.
 
-11/11 Node tests pass (`test/`), plus the page-driver logic (`content.js`) has been exercised live against real DOM.
+19/19 Node tests pass (`test/`), plus the page-driver logic (`content.js`) has been exercised live against real DOM. The toolbar icon's popup (`popup.html`) shows daemon connection + session status read-only by design: a popup-side "turn control off" would only stop *new* commands — the daemon keeps its socket either way — so it would be theatre, not a kill switch.
 
 ## Why Safari needed its own extension, not a port
 
@@ -22,7 +26,6 @@ The real BrowserSkill extension is built on `chrome.debugger` (CDP) for input, l
 ## Build & run
 
 ```bash
-cd apps/extension-safari
 ./rebuild.sh   # regenerates + builds the Xcode wrapper (see the script's own header comment
                # for two real gotchas it works around: --copy-resources is required or the
                # built extension silently ships with no manifest.json, and the wrapper's

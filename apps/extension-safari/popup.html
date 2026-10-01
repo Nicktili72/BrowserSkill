@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>BrowserSkill</title></head>
+<body style="font: 13px -apple-system, system-ui, sans-serif; width: 240px; margin: 0; padding: 10px;">
+  <div id="status">Checking…</div>
+  <script>
+    // MV2 page-action popup: report whether the daemon WS is connected so a
+    // human can see (and verify) that the agent channel is live. A page
+    // action's popup is its own chrome-untrusted origin with no DOM access to
+    // the background page, so status comes over runtime messaging.
+    //
+    // Keep this read-only: any "turn control off" switch that lives in the
+    // popup would only stop *new* commands — the daemon could keep streaming
+    // into the still-open socket, so it would be theatre, not a kill switch.
+    // A real kill switch means the daemon dropping the socket, which belongs
+    // in the CLI/daemon.
+    browser.runtime.sendMessage({ type: 'bsk-status-request' }, (s) => {
+      const el = document.getElementById('status');
+      if (browser.runtime.lastError || !s) {
+        el.textContent = 'Daemon: NOT connected';
+        return;
+      }
+      const esc = (v) => String(v).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+      el.innerHTML =
+        'Daemon: <b>' + (s.connected ? 'connected' : 'NOT connected') + '</b><br>' +
+        'Session: ' + esc(s.activeSession || 'none') + '<br>' +
+        'Agent tabs: ' + s.tabCount;
+    });
+  </script>
+</body>
+</html>
