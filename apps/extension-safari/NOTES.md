@@ -61,3 +61,12 @@ xcrun notarytool log <submission-id> --keychain-profile "<profile-name>" | grep 
 If they differ, re-zip the *current* export and resubmit (the **Notarize** step above), then staple. Always zip, submit, and staple the same export — don't re-export in between.
 
 Safari's extension loader uses the same Gatekeeper verdict as `spctl -a -vvv -t exec <app>`; until that says "Notarized Developer ID", Safari won't load the build without Develop → Allow Unsigned Extensions.
+
+## `bsk` auto-update will undo the daemon patch
+
+The daemon checks for new `bsk` releases and, by default, replaces its own binary with the upstream one (`bsk status` prints "A new bsk version is available ... The daemon will upgrade bsk automatically"). Upstream doesn't have the `safari-web-extension://` origin patch, so after an upgrade the daemon answers the extension's WebSocket handshake with `403 Origin not in chrome-extension allow-list`, and Safari's Settings → Extensions → BrowserSkill panel shows `[bsk] ws error (background.js:...)`.
+
+- Start the daemon with `BSK_AUTO_UPDATE=off` (switch is in `crates/bsk-cli/src/cli/update.rs`; any value other than `off` leaves auto-update on). The "new version available" notice still prints — it's only a hint.
+- Quick check that the running binary is patched: `strings $(which bsk) | grep -c safari-web-extension` (non-zero = patched), or probe the handshake: `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:52800/extension -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Origin: safari-web-extension://3610fd31-0161-4c6b-919a-ee9a3edb2c19'` should print `101`, not `403`.
+- If it did get replaced: rebuild with `cargo build -p bsk`, `bsk daemon stop`, restart with the env var set.
+- Safari keeps an extension's error entries until the extension reloads, so a stale `ws error` can remain after the cause is fixed; quit and relaunch Safari (or untick/retick the extension) to clear it.

@@ -36,7 +36,7 @@ The real BrowserSkill extension is built on `chrome.debugger` (CDP) for input, l
 Then, every time Safari has been fully quit (macOS resets this on every full quit — not a one-time step):
 1. Safari → Develop → **Allow Unsigned Extensions**
 2. Safari → Settings → Extensions → enable **"BrowserSkill for Safari"**, allow on every website
-3. `bsk daemon start` (or let a `bsk` command auto-start it)
+3. `BSK_AUTO_UPDATE=off bsk daemon start` (or export `BSK_AUTO_UPDATE=off` in your shell profile and let a `bsk` command auto-start it). **Keep auto-update off:** `bsk`'s daemon upgrades its own binary in the background, and the upgrade replaces your patched build with upstream's, which rejects Safari's origin — the extension then shows `[bsk] ws error` in Safari's extension error panel and never connects.
 4. `bsk browsers` should show one connected Safari instance
 
 ### Signing / distribution
