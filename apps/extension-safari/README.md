@@ -2,11 +2,23 @@
 
 Lets `bsk` (BrowserSkill's own CLI + daemon, unmodified in spirit) drive **Safari**, the same way the upstream extension drives Chrome/Edge — so Hermes Agent, Claude Code, Cursor, Codex, or any other `bsk`-aware agent harness can automate Safari too.
 
+> **Unofficial.** This project is not affiliated with or endorsed by Tencent or Apple. BrowserSkill (`bsk`) is Tencent's open-source project; this adds Safari support to it.
+
 This is a from-scratch Safari extension speaking `bsk`'s real wire protocol (`bsk-protocol`), not a bridge process and not a separate tool.
 
 This repo is just the extension — it doesn't carry BrowserSkill's own (large) source tree. `bsk` itself needs one small patch to its daemon before it will accept a Safari connection at all (it only recognizes `chrome-extension://` origins otherwise); that patch is [`daemon-origin-patch.diff`](daemon-origin-patch.diff) in this repo. Either:
 - clone [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill), apply `daemon-origin-patch.diff` (required) and `daemon-upload-patch.diff` (only needed for `upload`) with `git am`, and `cargo build -p bsk`, or
 - use the [full fork](https://github.com/Nicktili72/BrowserSkill/tree/safari-support) (branch `safari-support`), which already has it applied and also contains this same extension under `apps/extension-safari/`.
+
+## Security — read this first
+
+This extension lets a local AI agent drive your real, logged-in Safari: it can read pages (including whatever is behind your logins), click, type and run script on every site you allow. Treat it like handing that agent your browser.
+
+- **Everything stays local.** The extension talks only to the `bsk` daemon on `ws://127.0.0.1:52800/extension`; it sends nothing to any remote service.
+- **You choose the sites.** Safari only lets it act on sites you allow in Settings → Extensions (it asks for *Always Allow on Every Website*; you can allow specific sites instead).
+- **Your own tabs need your OK.** Taking over a tab you're already using (`tab borrow`) asks for approval in a popup; agent work otherwise happens in a separate window. `fill` refuses password fields.
+- **Who can connect.** The daemon's device authorization is the real control; its origin allow-list is only a soft gate against web pages, and any process running as you can reach a local daemon (see `NOTES.md` → Trust model). Don't run an unknown daemon on that port.
+- **Web pages can message extensions in Safari**, so the background page only honours messages from the extension's own pages.
 
 ## Status
 
