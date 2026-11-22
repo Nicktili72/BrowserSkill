@@ -16,6 +16,7 @@
 //! * `session.start` / `session.stop` / `session.stop_all` / `session.list` (M5)
 //! * `browser.list` (M4)
 
+use base64::Engine;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -38,6 +39,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+/// Cap on bytes inlined into one tool.upload for a Safari browser (base64 grows
+/// it by a third; the WebSocket message limit is 64 MiB).
+const SAFARI_INLINE_UPLOAD_MAX: u64 = 16 * 1024 * 1024;
 use tracing::{debug, warn};
 
 use super::abort::AbortRegistry;
@@ -483,7 +488,35 @@ async fn handle_tool_dispatch(
             Ok(v) => v,
             Err(err) => return ResponseBody::Err(err),
         };
+        // Safari's sandboxed extension cannot read `staged_path`, so for Safari
+        // browsers the bytes travel inline (bounded; see SAFARI_INLINE_UPLOAD_MAX).
+        let inline_bytes = state
+            .sessions
+            .get(&session_id)
+            .and_then(|s| state.browsers.get(&s.browser_id))
+            .is_some_and(|b| b.browser_name.eq_ignore_ascii_case("safari"));
+        let mut inline_total: u64 = 0;
         for (file, path) in upload.files.iter_mut().zip(paths) {
+            if inline_bytes {
+                let size = match std::fs::metadata(&path) {
+                    Ok(m) => m.len(),
+                    Err(err) => return ResponseBody::Err(invalid_params(format!("cannot read staged upload: {err}"))),
+                };
+                inline_total = inline_total.saturating_add(size);
+                if inline_total > SAFARI_INLINE_UPLOAD_MAX {
+                    return ResponseBody::Err(invalid_params(format!(
+                        "Safari uploads are limited to {} MiB per call (this call: {} MiB)",
+                        SAFARI_INLINE_UPLOAD_MAX / (1024 * 1024),
+                        inline_total.div_ceil(1024 * 1024),
+                    )));
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        file.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+                    }
+                    Err(err) => return ResponseBody::Err(invalid_params(format!("cannot read staged upload: {err}"))),
+                }
+            }
             file.staged_path = Some(path.to_string_lossy().into_owned());
         }
         params = serde_json::to_value(upload).unwrap_or(Value::Null);

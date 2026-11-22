@@ -87,6 +87,7 @@ pub fn dispatch(args: UploadArgs, format: Format) -> Result<(), CliError> {
                 transfer_id: id.clone(),
                 name: name.clone(),
                 staged_path: None,
+                data_base64: None,
             })
             .collect(),
         mode: args.mode.into(),
