@@ -3,7 +3,9 @@
 // implements a reduced tool set: session_start/stop, tab_list/create/close/
 // select/borrow/return, navigate, snapshot, observe, click, fill, press,
 // select, focus, blur, wheel, scroll_to, get_html, wait_for_navigation,
-// evaluate, console, network, upload, hover, screenshot. Anything else in bsk-protocol's Method enum gets a clean
+// evaluate, console, network, upload, hover, reload, navigate_back/forward,
+// window_resize, screenshot (viewport, element crop, full page + read/release).
+// Anything else in bsk-protocol's Method enum gets a clean
 // `unsupported` error rather than silently doing nothing — see NOTES.md
 // for what's out of scope and why.
 //
@@ -17,6 +19,8 @@
 
 const WS_URL = 'ws://127.0.0.1:52800/extension';
 const HEARTBEAT_MS = 20000;
+const MAX_DEVICE_HEIGHT = 32000; // full-page screenshot: taller pages are scaled down to this (canvas size limits)
+const READ_CHUNK_BYTES = 192 * 1024; // base64 makes this 256 KiB on the wire
 
 // Loaded from protocol.js: via require() under Node (tests), or the
 // global object in the real extension (manifest.json loads it as a
@@ -32,10 +36,51 @@ const HEARTBEAT_MS = 20000;
 // plain function-scoped const shadowing them is fine.
 const protocolModule = () => (typeof require !== 'undefined' ? require('./protocol.js') : self);
 
+// Image work for element-crop and full-page screenshots. Safari only offers
+// captureVisibleTab, so cropping/stitching happens on a canvas in the
+// background page. Injected as `env.imaging` in tests.
+function toBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function domImaging(doc) {
+  const decode = async (dataUrl) => { const img = new Image(); img.src = dataUrl; await img.decode(); return img; };
+  const png = async (canvas) => {
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+    return new Uint8Array(await blob.arrayBuffer());
+  };
+  const canvas = (w, h) => { const c = doc.createElement('canvas'); c.width = w; c.height = h; return c; };
+  return {
+    async crop(dataUrl, r) {
+      const img = await decode(dataUrl);
+      const x = Math.max(0, Math.round(r.x)), y = Math.max(0, Math.round(r.y));
+      const w = Math.min(img.naturalWidth - x, Math.round(r.width)), h = Math.min(img.naturalHeight - y, Math.round(r.height));
+      if (w <= 0 || h <= 0) throw { code: 'not_found', message: 'element is outside the visible area' };
+      const c = canvas(w, h);
+      c.getContext('2d').drawImage(img, x, y, w, h, 0, 0, w, h);
+      const bytes = await png(c);
+      return { base64: toBase64(bytes), width: w, height: h };
+    },
+    // `scale` < 1 shrinks everything so a very tall page still fits the canvas.
+    async stitch(frames, width, height, scale = 1) {
+      const c = canvas(width, height);
+      const ctx = c.getContext('2d');
+      for (const f of frames) {
+        const img = await decode(f.dataUrl);
+        ctx.drawImage(img, 0, Math.round(f.y * scale), Math.round(img.naturalWidth * scale), Math.round(img.naturalHeight * scale));
+      }
+      return { bytes: await png(c), width, height };
+    },
+  };
+}
+
 function makeBackground(env) {
   const { browser, WebSocket, console, crypto, setTimeout, clearTimeout, setInterval, clearInterval } = env;
+  const imaging = env.imaging || domImaging(env.document);
   const { handshakeParams, NO_DIALOGS, keyToCode, keyToModifiers, rpcOk, rpcErr } = protocolModule();
   const sessions = new Map(); // session_id -> { agentWindowId, agentTabIds:Set<number>, borrowed:Map<tabId,{originalWindowId,originalIndex}> }
+  const captures = new Map(); // capture_id -> { sessionId, bytes } (full-page screenshots awaiting screenshot_read)
   const pendingConfirmations = new Map(); // requestId -> resolve(allow)
   let ws = null;
   let reconnectDelay = 500;
@@ -142,6 +187,38 @@ function makeBackground(env) {
     return res;
   }
 
+  // After an action that starts a navigation (reload/back/forward): wait for it
+  // to start (status leaves 'complete', or the URL changes), then for it to
+  // finish. `expectChange` makes "nothing happened" an error (no history entry).
+  async function afterNavAction(tabId, before, { want = 'load', timeoutMs = 30000, expectChange = false } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    const live = () => browser.tabs.get(tabId).catch(() => null);
+    let tab = await live();
+    const started = () => tab && (tab.status !== 'complete' || tab.url !== before.url);
+    for (let i = 0; i < 8 && tab && !started(); i++) { await sleep(150); tab = await live(); }
+    if (!tab) throw { code: 'not_found', message: `tab ${tabId} was closed` };
+    if (expectChange && !started()) throw { code: 'not_found', message: 'there is no history entry in that direction' };
+    while (tab && tab.status !== 'complete' && Date.now() < deadline) { await sleep(250); tab = await live(); }
+    if (!tab) throw { code: 'not_found', message: `tab ${tabId} was closed` };
+    const done = tab.status === 'complete';
+    if (done && want === 'networkidle') await sleep(500); // ponytail: approximation, see wait_for_navigation
+    return { final_url: tab.url, reached: done ? want : 'timeout' };
+  }
+
+  async function historyGo(tabId, delta) {
+    const native = delta < 0 ? browser.tabs.goBack : browser.tabs.goForward;
+    if (typeof native === 'function') return native.call(browser.tabs, tabId);
+    return page(tabId, { op: 'history', delta }); // content script fallback
+  }
+
+  async function capturePng(tabId) {
+    const tab = await activateTab(tabId);
+    await sleep(150); // let the tab actually paint after gaining focus
+    const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    if (!/^data:image\/png;base64,/.test(String(dataUrl))) throw { code: 'protocol_error', message: 'captureVisibleTab returned an unexpected format' };
+    return String(dataUrl);
+  }
+
   function requestBorrowConfirmation(tab, timeoutMs) {
     return new Promise(async (resolve) => {
       const requestId = 'borrow-' + Date.now() + '-' + Math.random().toString(36).slice(2);
@@ -194,6 +271,7 @@ function makeBackground(env) {
       s.borrowed.clear();
       try { await browser.windows.remove(s.agentWindowId); } catch { /* already closed */ }
       sessions.delete(p.session_id);
+      for (const [id, c] of captures) if (c.sessionId === p.session_id) captures.delete(id);
       return { returned_tab_ids: returned, return_failures: [] };
     },
 
@@ -411,15 +489,100 @@ function makeBackground(env) {
       return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, x: r.x, y: r.y, width: r.width, height: r.height });
     },
 
+    // Viewport by default; with a ref/selector the element is scrolled into
+    // view and the capture is cropped to it (clamped to what is visible).
     'tool.screenshot': async (p) => {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
-      const tab = await activateTab(tabId);
-      await sleep(150); // let the tab actually paint after gaining focus
-      const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-      const m = /^data:image\/png;base64,(.*)$/.exec(String(dataUrl));
-      if (!m) throw { code: 'protocol_error', message: 'captureVisibleTab returned an unexpected format' };
+      await activateTab(tabId);
+      const rect = p.ref || p.selector ? await page(tabId, { op: 'rect', ref: p.ref, selector: p.selector }) : null;
+      const dataUrl = await capturePng(tabId);
+      if (rect) {
+        const k = rect.dpr || 1;
+        const c = await imaging.crop(dataUrl, { x: rect.x * k, y: rect.y * k, width: rect.width * k, height: rect.height * k });
+        return withDialogs({ image_base64: c.base64, width: c.width, height: c.height, format: 'png', tab_id: tabId });
+      }
       const dims = await page(tabId, { op: 'viewportSize' }).catch(() => ({ width: 0, height: 0 }));
-      return withDialogs({ image_base64: m[1], width: dims.width, height: dims.height, format: 'png', tab_id: tabId });
+      return withDialogs({ image_base64: dataUrl.slice('data:image/png;base64,'.length), width: dims.width, height: dims.height, format: 'png', tab_id: tabId });
+    },
+
+    // Scroll top to bottom, capture each viewport, stitch on a canvas. Limits:
+    // fixed/sticky elements repeat in every frame, and a page taller than
+    // MAX_DEVICE_HEIGHT device pixels is scaled down to fit (never cut off).
+    'tool.screenshot_full_page': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const follow = p.scope !== 'current';
+      const deadline = Date.now() + (p.timeout_ms || 120000);
+      await activateTab(tabId);
+      const m = await page(tabId, { op: 'scrollMetrics' });
+      const dpr = m.dpr || 1;
+      let height = m.height;
+      const frames = [];
+      let want = 0, lastY = -1;
+      for (let n = 0; n < 200; n++) {
+        const s = await page(tabId, { op: 'scrollToY', y: want });
+        if (follow) height = Math.max(height, s.height);
+        if (s.y === lastY) break; // clamped at the bottom: no progress
+        lastY = s.y;
+        await sleep(250); // lazy content / sticky headers settle
+        frames.push({ dataUrl: await capturePng(tabId), y: Math.round(s.y * dpr) });
+        if (s.y + m.vh >= height) break;
+        if (Date.now() > deadline) throw { code: 'timeout', message: 'full-page capture timed out' };
+        want = s.y + m.vh;
+      }
+      await page(tabId, { op: 'scrollToY', y: m.y }).catch(() => {}); // put the page back
+      const deviceH = Math.round(height * dpr);
+      const scale = deviceH > MAX_DEVICE_HEIGHT ? MAX_DEVICE_HEIGHT / deviceH : 1;
+      const out = await imaging.stitch(frames, Math.round(m.vw * dpr * scale), Math.round(deviceH * scale), scale);
+      const id = `cap_${crypto.randomUUID()}`;
+      captures.set(id, { sessionId: p.session_id, bytes: out.bytes });
+      while (captures.size > 5) captures.delete(captures.keys().next().value); // oldest out
+      return withDialogs({ scope: follow ? 'follow' : 'current', capture_id: id, width: out.width, height: out.height, format: 'png', tab_id: tabId, byte_size: out.bytes.length });
+    },
+
+    'tool.screenshot_read': async (p) => {
+      const c = captures.get(p.capture_id);
+      if (!c || c.sessionId !== p.session_id) throw { code: 'not_found', message: 'unknown capture_id (released, evicted, or from another session)' };
+      const start = Math.min(p.offset || 0, c.bytes.length);
+      const end = Math.min(start + READ_CHUNK_BYTES, c.bytes.length);
+      return { data_base64: toBase64(c.bytes.subarray(start, end)), next_offset: end, eof: end >= c.bytes.length };
+    },
+
+    'tool.screenshot_release': async (p) => {
+      const c = captures.get(p.capture_id);
+      const owned = !!c && c.sessionId === p.session_id;
+      if (owned) captures.delete(p.capture_id);
+      return { released: owned };
+    },
+
+    'tool.reload': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const before = await browser.tabs.get(tabId);
+      await browser.tabs.reload(tabId, { bypassCache: !!p.hard });
+      const r = await afterNavAction(tabId, before, { want: p.wait_until, timeoutMs: p.timeout_ms });
+      return withDialogs({ tab_id: tabId, previous_url: before.url, ...r });
+    },
+
+    'tool.navigate_back': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const before = await browser.tabs.get(tabId);
+      await historyGo(tabId, -1);
+      const r = await afterNavAction(tabId, before, { want: p.wait_until, timeoutMs: p.timeout_ms, expectChange: true });
+      return withDialogs({ tab_id: tabId, previous_url: before.url, ...r });
+    },
+
+    'tool.navigate_forward': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const before = await browser.tabs.get(tabId);
+      await historyGo(tabId, 1);
+      const r = await afterNavAction(tabId, before, { want: p.wait_until, timeoutMs: p.timeout_ms, expectChange: true });
+      return withDialogs({ tab_id: tabId, previous_url: before.url, ...r });
+    },
+
+    'tool.window_resize': async (p) => {
+      const s = requireSession(p);
+      await browser.windows.update(s.agentWindowId, { width: p.width, height: p.height });
+      const w = await browser.windows.get(s.agentWindowId);
+      return { window_id: w.id, width: w.width, height: w.height };
     },
   };
 
@@ -467,5 +630,5 @@ function makeBackground(env) {
 if (typeof module !== 'undefined') {
   module.exports = { makeBackground };
 } else {
-  makeBackground({ browser, WebSocket, console, crypto, navigator, setTimeout, clearTimeout, setInterval, clearInterval }).connect();
+  makeBackground({ browser, WebSocket, console, crypto, navigator, document, setTimeout, clearTimeout, setInterval, clearInterval }).connect();
 }

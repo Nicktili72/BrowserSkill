@@ -124,6 +124,8 @@
   let hovered = null;
   const chain = (el) => { const out = []; for (let n = el; n; n = n.parentElement) out.unshift(n); return out; }; // root … el
 
+  const pageHeight = () => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0);
+
   const setValue = (el, v) => {
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
@@ -270,6 +272,17 @@
       await new Promise((r) => setTimeout(r, m.settleMs ?? 100));
       return { usedRef, usedSelector, x, y };
     },
+    // Geometry for screenshot cropping (scrolls the element into view first).
+    rect: (m) => {
+      const { el, usedRef, usedSelector } = resolve(m);
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height, dpr: devicePixelRatio, usedRef, usedSelector };
+    },
+    // Full-page screenshot: background.js scrolls frame by frame and stitches.
+    scrollMetrics: () => ({ height: pageHeight(), vh: innerHeight, vw: innerWidth, dpr: devicePixelRatio, y: scrollY }),
+    scrollToY: (m) => { window.scrollTo({ top: m.y, behavior: 'instant' }); return { y: scrollY, height: pageHeight() }; },
+    history: (m) => { history.go(m.delta); return {}; },
     getHtml: (m) => {
       const { el, usedRef, usedSelector } = m.ref || m.selector ? resolve(m) : { el: document.documentElement };
       const bytes = new TextEncoder().encode(el.outerHTML);
