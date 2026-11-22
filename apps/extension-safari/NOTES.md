@@ -96,3 +96,12 @@ Safari has no debugger/CDP, so everything is done from a content script plus `br
 3. Zip, `notarytool submit --wait`, `stapler staple` on the new export.
 4. Quit Safari, move the old `export/` aside, put the new one in place, and make sure it is the **only** registered copy: `pluginkit -mAvvv -p com.apple.Safari.web-extension | grep browserskill` (an `xcodebuild archive` registers its own build-intermediate copy under `DerivedData/…/ArchiveIntermediates/` — unregister that one with `lsregister -u` or Safari will load an un-notarized build). Re-register with `lsregister -f` on the new app.
 5. Relaunch Safari and re-tick the extension in Settings → Extensions (a re-registered extension comes back off).
+
+## Keeping up with upstream (protocol 2.0)
+
+The extension was first built against bsk 0.3.x (protocol 1.3). Current upstream (0.5.0) moved to **protocol 2.0**, and what that meant in practice (tested by running the real `background.js` in Node against a daemon built from upstream `main`, with a fake `browser`, driven by the new CLI — see below):
+
+- The daemon **kicks a peer whose protocol major differs** ("protocol major mismatch (peer=1.3, local=2.0)"), after the origin check passes. The only extension change needed was `PROTOCOL_VERSION`/`MIN_COMPATIBLE_PROTOCOL` = `"2.0"` in `protocol.js`; session start, tab ops, navigate, snapshot/observe, click, screenshot, wait, reload and window resize then worked unchanged.
+- Upstream added peer authorization (HMAC pairing / device authorization), but a peer that doesn't pair is still accepted through the daemon's **legacy** path (the same one the Chrome extension used before pairing); the Safari extension does not implement pairing.
+- Both daemon patches had to be re-done by hand: `origin_allowed()` lost its `allow_any` argument, and upload staging moved from `ipc.rs` into `tool_pipeline.rs` (now with `spawn_blocking`). They are re-generated as `daemon-origin-patch.diff` / `daemon-upload-patch.diff` against `dca6048e`.
+- Quick compatibility check after any upstream bump, without touching Safari: build upstream+patches, start its daemon with an isolated `BSK_HOME=/tmp/x` on port 52800, and run the extension's real `background.js` in Node (`dev/ext-harness.cjs`: a fake `browser` and a `WebSocket` subclass that sets the `Origin: safari-web-extension://<uuid>` header); then drive it with the new `bsk` CLI. (Node's built-in `WebSocket` accepts a `headers` option.) Results that fail with "decode result: missing field" come from the fake page, not the protocol.

@@ -1,10 +1,10 @@
 // Pure wire-protocol helpers, shared by background.js (classic script) and
 // the Node test harness (via module.exports). No browser API calls here.
 
-const PROTOCOL_VERSION = '1.3';
+const PROTOCOL_VERSION = '2.0'; // bsk-protocol's PROTOCOL_VERSION; the daemon kicks a peer whose major differs
 // Lowest daemon protocol we require; matches bsk-cli's MIN_COMPATIBLE_PROTOCOL
 // floor so a much-older daemon fails the handshake instead of half-working.
-const MIN_COMPATIBLE_PROTOCOL = '1.0';
+const MIN_COMPATIBLE_PROTOCOL = '2.0';
 const CLIENT_NAME = 'browser-skill-safari-extension';
 
 function handshakeParams({ instanceId, extVersion, browserVersion, label }) {

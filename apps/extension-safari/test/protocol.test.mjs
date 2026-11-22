@@ -7,7 +7,7 @@ const { handshakeParams, keyToCode, rpcOk, rpcErr, PROTOCOL_VERSION, MIN_COMPATI
 
 test('handshake params match bsk-cli daemon/state.rs constants', () => {
   const p = handshakeParams({ instanceId: 'i1', extVersion: '0.1.0', browserVersion: '17.4', label: 'Safari' });
-  assert.equal(p.protocol_version, '1.3');
+  assert.equal(p.protocol_version, '2.0');
   assert.equal(p.protocol_version, PROTOCOL_VERSION);
   assert.equal(p.min_compatible_protocol, MIN_COMPATIBLE_PROTOCOL);
   assert.equal(p.min_compatible_peer, '0.0.0');

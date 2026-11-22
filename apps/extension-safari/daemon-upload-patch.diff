@@ -1,28 +1,42 @@
-From baea5a42faade27b6307faf4240427e4b50e172b Mon Sep 17 00:00:00 2001
+From b5ca980c299421087d4f99a01c6c01596347f3a0 Mon Sep 17 00:00:00 2001
 From: NickT72 <35966711+Nicktili72@users.noreply.github.com>
-Date: Sun, 22 Nov 2026 14:21:10 +0200
+Date: Sun, 22 Nov 2026 14:59:34 +0200
 Subject: [PATCH] daemon: inline upload bytes for Safari browsers
 
-Safari's sandboxed app extension cannot read the staged_path the daemon
-injects into tool.upload, so for browsers whose handshake name is Safari
-the daemon also sends each file's bytes as UploadFile.data_base64
-(bounded at 16 MiB per call; larger uploads get an invalid_params error
-that says so). Other browsers are unaffected. The new field is
-daemon-injected and never agent-facing; schema regenerated.
-
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+A Safari Web Extension is sandboxed and cannot read the staged_path the daemon
+injects into tool.upload. For browsers whose handshake name is Safari the daemon
+now also sends each file's bytes as UploadFile.data_base64 (standard base64,
+capped at 16 MiB per call; larger uploads get an invalid_params error that says
+so). The read runs on a blocking thread like the rest of upload staging. Other
+browsers are unaffected. The field is daemon-injected and never agent-facing;
+the upload params schema is regenerated.
 ---
+ crates/bsk-cli/src/cli/mcp/tools.rs           |  1 +
  crates/bsk-cli/src/cli/upload.rs              |  1 +
- crates/bsk-cli/src/daemon/ipc.rs              | 33 +++++++++++++++++++
- .../schema/tool_upload_params.json            |  7 ++++
- .../bsk-protocol/src/tools/file_transfer.rs   |  7 ++++
- 4 files changed, 48 insertions(+)
+ crates/bsk-cli/src/daemon/file_transfer.rs    | 51 +++++++++++++++++++
+ crates/bsk-cli/src/daemon/tool_pipeline.rs    | 33 +++++++++++-
+ crates/bsk-cli/src/daemon/ws.rs               |  4 +-
+ .../schema/tool_upload_params.json            |  7 +++
+ .../bsk-protocol/src/tools/file_transfer.rs   |  7 +++
+ 7 files changed, 102 insertions(+), 2 deletions(-)
 
+diff --git a/crates/bsk-cli/src/cli/mcp/tools.rs b/crates/bsk-cli/src/cli/mcp/tools.rs
+index 43301dcb..78ad0f15 100644
+--- a/crates/bsk-cli/src/cli/mcp/tools.rs
++++ b/crates/bsk-cli/src/cli/mcp/tools.rs
+@@ -2544,6 +2544,7 @@ async fn interact(link: &Link, prepared: Prepared) -> Result<Reply, CliError> {
+                         transfer_id: id.clone(),
+                         name: name.clone(),
+                         staged_path: None,
++                        data_base64: None,
+                     })
+                     .collect(),
+                 mode,
 diff --git a/crates/bsk-cli/src/cli/upload.rs b/crates/bsk-cli/src/cli/upload.rs
-index 7249a8d..3ac2aaf 100644
+index a088f1fb..2c42cfd7 100644
 --- a/crates/bsk-cli/src/cli/upload.rs
 +++ b/crates/bsk-cli/src/cli/upload.rs
-@@ -87,6 +87,7 @@ pub fn dispatch(args: UploadArgs, format: Format) -> Result<(), CliError> {
+@@ -105,6 +105,7 @@ pub fn dispatch(
                  transfer_id: id.clone(),
                  name: name.clone(),
                  staged_path: None,
@@ -30,75 +44,149 @@ index 7249a8d..3ac2aaf 100644
              })
              .collect(),
          mode: args.mode.into(),
-diff --git a/crates/bsk-cli/src/daemon/ipc.rs b/crates/bsk-cli/src/daemon/ipc.rs
-index b6350ce..f813896 100644
---- a/crates/bsk-cli/src/daemon/ipc.rs
-+++ b/crates/bsk-cli/src/daemon/ipc.rs
-@@ -16,6 +16,7 @@
- //! * `session.start` / `session.stop` / `session.stop_all` / `session.list` (M5)
- //! * `browser.list` (M4)
+diff --git a/crates/bsk-cli/src/daemon/file_transfer.rs b/crates/bsk-cli/src/daemon/file_transfer.rs
+index 12ce8aec..2222c17d 100644
+--- a/crates/bsk-cli/src/daemon/file_transfer.rs
++++ b/crates/bsk-cli/src/daemon/file_transfer.rs
+@@ -23,6 +23,9 @@ use super::paths;
+ pub const TRANSFER_CHUNK_SIZE: u32 = 512 * 1024;
+ pub const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
+ pub const MAX_UPLOAD_FILES: usize = 20;
++/// Cap on the bytes inlined into one `tool.upload` for a Safari browser (base64
++/// adds a third on the wire; the WebSocket message limit is far above this).
++pub const SAFARI_INLINE_UPLOAD_MAX: u64 = 16 * 1024 * 1024;
  
-+use base64::Engine;
- use std::future::Future;
- use std::path::PathBuf;
- use std::pin::Pin;
-@@ -38,6 +39,10 @@ use serde::{Deserialize, Serialize};
- use serde_json::Value;
- use tokio::sync::Notify;
- use tokio::task::JoinHandle;
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum Direction {
+@@ -715,6 +718,31 @@ fn invalid(message: impl Into<String>) -> RpcError {
+         data: None,
+     }
+ }
++/// Read the staged files and return their bytes as standard base64, in order.
++/// Used for browsers whose extension cannot read `staged_path` (Safari). Fails
++/// with `invalid_params` when the total exceeds `max` bytes.
++pub fn inline_upload_bytes(paths: &[PathBuf], max: u64) -> Result<Vec<String>, RpcError> {
++    let mut total: u64 = 0;
++    let mut out = Vec::with_capacity(paths.len());
++    for path in paths {
++        let size = fs::metadata(path)
++            .map_err(|err| not_found(format!("cannot read staged upload: {err}")))?
++            .len();
++        total = total.saturating_add(size);
++        if total > max {
++            return Err(invalid(format!(
++                "Safari uploads are limited to {} MiB per call (this call: {} MiB)",
++                max / (1024 * 1024),
++                total.div_ceil(1024 * 1024),
++            )));
++        }
++        let bytes =
++            fs::read(path).map_err(|err| not_found(format!("cannot read staged upload: {err}")))?;
++        out.push(base64::engine::general_purpose::STANDARD.encode(bytes));
++    }
++    Ok(out)
++}
 +
-+/// Cap on bytes inlined into one tool.upload for a Safari browser (base64 grows
-+/// it by a third; the WebSocket message limit is 64 MiB).
-+const SAFARI_INLINE_UPLOAD_MAX: u64 = 16 * 1024 * 1024;
- use tracing::{debug, warn};
- 
- use super::abort::AbortRegistry;
-@@ -483,7 +488,35 @@ async fn handle_tool_dispatch(
-             Ok(v) => v,
-             Err(err) => return ResponseBody::Err(err),
-         };
-+        // Safari's sandboxed extension cannot read `staged_path`, so for Safari
-+        // browsers the bytes travel inline (bounded; see SAFARI_INLINE_UPLOAD_MAX).
+ fn not_found(message: impl Into<String>) -> RpcError {
+     RpcError {
+         code: ErrorCode::NotFound,
+@@ -1149,4 +1177,27 @@ mod tests {
+                 .is_ok()
+         );
+     }
++
++    #[test]
++    fn inline_upload_bytes_encodes_in_order_and_enforces_the_cap() {
++        let temp = tempfile::tempdir().unwrap();
++        let a = temp.path().join("a.bin");
++        let b = temp.path().join("b.bin");
++        fs::write(&a, [0xff, 0x00, 0x10]).unwrap();
++        fs::write(&b, b"hi").unwrap();
++        let both = [a.clone(), b.clone()];
++
++        let ok = inline_upload_bytes(&both, 16).unwrap();
++        assert_eq!(ok, vec!["/wAQ".to_string(), "aGk=".to_string()]);
++
++        let err = inline_upload_bytes(&both, 4).unwrap_err();
++        assert_eq!(err.code, ErrorCode::InvalidParams);
++        assert!(err.message.contains("limited to"), "{}", err.message);
++
++        let missing = [temp.path().join("nope")];
++        assert_eq!(
++            inline_upload_bytes(&missing, 16).unwrap_err().code,
++            ErrorCode::NotFound
++        );
++    }
+ }
+diff --git a/crates/bsk-cli/src/daemon/tool_pipeline.rs b/crates/bsk-cli/src/daemon/tool_pipeline.rs
+index 138bf07e..c6c95e57 100644
+--- a/crates/bsk-cli/src/daemon/tool_pipeline.rs
++++ b/crates/bsk-cli/src/daemon/tool_pipeline.rs
+@@ -1088,7 +1088,38 @@ async fn handle_tool_dispatch(
+                     });
+                 }
+             };
+-        for (file, path) in upload.files.iter_mut().zip(paths) {
++        // A sandboxed Safari extension cannot read `staged_path`, so for Safari
++        // browsers the bytes travel inline too (bounded; see SAFARI_INLINE_UPLOAD_MAX).
 +        let inline_bytes = state
 +            .sessions
 +            .get(&session_id)
 +            .and_then(|s| state.browsers.get(&s.browser_id))
 +            .is_some_and(|b| b.browser_name.eq_ignore_ascii_case("safari"));
-+        let mut inline_total: u64 = 0;
-         for (file, path) in upload.files.iter_mut().zip(paths) {
-+            if inline_bytes {
-+                let size = match std::fs::metadata(&path) {
-+                    Ok(m) => m.len(),
-+                    Err(err) => return ResponseBody::Err(invalid_params(format!("cannot read staged upload: {err}"))),
-+                };
-+                inline_total = inline_total.saturating_add(size);
-+                if inline_total > SAFARI_INLINE_UPLOAD_MAX {
-+                    return ResponseBody::Err(invalid_params(format!(
-+                        "Safari uploads are limited to {} MiB per call (this call: {} MiB)",
-+                        SAFARI_INLINE_UPLOAD_MAX / (1024 * 1024),
-+                        inline_total.div_ceil(1024 * 1024),
-+                    )));
-+                }
-+                match std::fs::read(&path) {
-+                    Ok(bytes) => {
-+                        file.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
-+                    }
-+                    Err(err) => return ResponseBody::Err(invalid_params(format!("cannot read staged upload: {err}"))),
++        let inlined: Vec<Option<String>> = if inline_bytes {
++            let read_paths = paths.clone();
++            match tokio::task::spawn_blocking(move || {
++                super::file_transfer::inline_upload_bytes(
++                    &read_paths,
++                    super::file_transfer::SAFARI_INLINE_UPLOAD_MAX,
++                )
++            })
++            .await
++            {
++                Ok(Ok(v)) => v.into_iter().map(Some).collect(),
++                Ok(Err(err)) => return ResponseBody::Err(err),
++                Err(join_err) => {
++                    return ResponseBody::Err(RpcError {
++                        code: ErrorCode::ProtocolError,
++                        message: format!("upload read worker failed: {join_err}"),
++                        data: None,
++                    });
 +                }
 +            }
++        } else {
++            vec![None; paths.len()]
++        };
++        for ((file, path), data) in upload.files.iter_mut().zip(paths).zip(inlined) {
++            file.data_base64 = data;
              file.staged_path = Some(path.to_string_lossy().into_owned());
          }
          params = serde_json::to_value(upload).unwrap_or(Value::Null);
+diff --git a/crates/bsk-cli/src/daemon/ws.rs b/crates/bsk-cli/src/daemon/ws.rs
+index f94fdf98..42436ac6 100644
+--- a/crates/bsk-cli/src/daemon/ws.rs
++++ b/crates/bsk-cli/src/daemon/ws.rs
+@@ -60,7 +60,9 @@ fn is_lowercase_uuid(s: &str) -> bool {
+     let lens = [8, 4, 4, 4, 12];
+     groups.len() == lens.len()
+         && groups.iter().zip(lens).all(|(g, len)| {
+-            g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
++            g.len() == len
++                && g.bytes()
++                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+         })
+ }
+ 
 diff --git a/crates/bsk-protocol/schema/tool_upload_params.json b/crates/bsk-protocol/schema/tool_upload_params.json
-index dd784b9..bcfc07f 100644
+index a7d01e35..4da4a8d4 100644
 --- a/crates/bsk-protocol/schema/tool_upload_params.json
 +++ b/crates/bsk-protocol/schema/tool_upload_params.json
-@@ -55,6 +55,13 @@
-         "transfer_id"
-       ],
+@@ -58,6 +58,13 @@
+     },
+     "UploadFile": {
        "properties": {
 +        "data_base64": {
-+          "description": "Daemon-injected, Safari only: the file's bytes (standard base64) for extensions that cannot read `staged_path` (a sandboxed Safari app extension has no filesystem access). Never agent-facing.",
++          "description": "Daemon-injected, Safari only: the file's bytes (standard base64) for\nextensions that cannot read `staged_path` (a sandboxed Safari app\nextension has no filesystem access). Never agent-facing.",
 +          "type": [
 +            "string",
 +            "null"
@@ -108,10 +196,10 @@ index dd784b9..bcfc07f 100644
            "type": "string"
          },
 diff --git a/crates/bsk-protocol/src/tools/file_transfer.rs b/crates/bsk-protocol/src/tools/file_transfer.rs
-index e2cd97c..6d7b5f7 100644
+index 0d6bc7b1..834159b6 100644
 --- a/crates/bsk-protocol/src/tools/file_transfer.rs
 +++ b/crates/bsk-protocol/src/tools/file_transfer.rs
-@@ -13,6 +13,11 @@ pub struct UploadFile {
+@@ -15,6 +15,11 @@ pub struct UploadFile {
      pub name: String,
      #[serde(default, skip_serializing_if = "Option::is_none")]
      pub staged_path: Option<String>,
@@ -123,7 +211,7 @@ index e2cd97c..6d7b5f7 100644
  }
  
  #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-@@ -166,6 +171,7 @@ mod tests {
+@@ -226,6 +231,7 @@ mod tests {
                  transfer_id: "tr_1".into(),
                  name: "image.png".into(),
                  staged_path: None,
@@ -131,7 +219,7 @@ index e2cd97c..6d7b5f7 100644
              }],
              mode: UploadMode::Input,
              timeout_ms: None,
-@@ -187,6 +193,7 @@ mod tests {
+@@ -251,6 +257,7 @@ mod tests {
                  transfer_id: "tr_1".into(),
                  name: "image.png".into(),
                  staged_path: None,

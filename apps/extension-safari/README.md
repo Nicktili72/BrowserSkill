@@ -7,8 +7,10 @@ Lets `bsk` (BrowserSkill's own CLI + daemon, unmodified in spirit) drive **Safar
 This is a from-scratch Safari extension speaking `bsk`'s real wire protocol (`bsk-protocol`), not a bridge process and not a separate tool.
 
 This repo is just the extension — it doesn't carry BrowserSkill's own (large) source tree. `bsk` itself needs one small patch to its daemon before it will accept a Safari connection at all (it only recognizes `chrome-extension://` origins otherwise); that patch is [`daemon-origin-patch.diff`](daemon-origin-patch.diff) in this repo. Either:
-- clone [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill), apply `daemon-origin-patch.diff` (required) and `daemon-upload-patch.diff` (only needed for `upload`) with `git am`, and `cargo build -p bsk`, or
+- clone [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill), apply `daemon-origin-patch.diff` (required) and `daemon-upload-patch.diff` (only needed for `upload`) with `git am` (both apply cleanly to upstream `main` as of `dca6048e`, bsk 0.5.0), and `cargo build -p bsk`, or
 - use the [full fork](https://github.com/Nicktili72/BrowserSkill/tree/safari-support) (branch `safari-support`), which already has it applied and also contains this same extension under `apps/extension-safari/`.
+
+**Version requirement:** the extension speaks bsk wire protocol **2.0** (bsk 0.5.0 and newer). An older daemon (0.3.x, protocol 1.x) disconnects it with "protocol major mismatch"; use a build of current upstream `main` with the two patches above.
 
 ## Security — read this first
 
