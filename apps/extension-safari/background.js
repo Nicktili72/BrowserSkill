@@ -1,7 +1,8 @@
 // BrowserSkill Safari extension — background page (MV2, persistent).
 // Connects to the real `bsk` daemon on ws://127.0.0.1:52800/extension and
 // implements a reduced tool set: session_start/stop, tab_list/create/close/
-// select/borrow/return, navigate, snapshot, click, fill, press, scroll_to,
+// select/borrow/return, navigate, snapshot, observe, click, fill, press,
+// select, focus, blur, wheel, scroll_to, get_html, wait_for_navigation,
 // screenshot. Anything else in bsk-protocol's Method enum gets a clean
 // `unsupported` error rather than silently doing nothing — see NOTES.md
 // for what's out of scope and why.
@@ -279,6 +280,64 @@ function makeBackground(env) {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
       const r = await page(tabId, { op: 'snapshot', maxChars: p.max_tokens ? p.max_tokens * 4 : 8000 });
       return withDialogs({ text: r.text, ref_count: r.refCount, tab_id: tabId, truncated: r.truncated });
+    },
+
+    // observe = snapshot here: no hover probing, cursor paging or depth cap
+    // (the extension has no VOM tree), so those params are ignored and
+    // `hover_probe` is omitted, which the protocol allows.
+    'tool.observe': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'snapshot', maxChars: p.max_tokens ? p.max_tokens * 4 : 8000 });
+      return withDialogs({ text: r.text, ref_count: r.refCount, tab_id: tabId, truncated: r.truncated });
+    },
+
+    'tool.get_html': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'getHtml', ref: p.ref, selector: p.selector, maxBytes: p.max_bytes });
+      return withDialogs({ html: r.html, truncated: r.truncated, byte_size: r.byteSize, tab_id: tabId });
+    },
+
+    'tool.select': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'select', ref: p.ref, selector: p.selector, values: p.values });
+      return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, multiple: r.multiple, selected_values: r.selectedValues, selected_labels: r.selectedLabels });
+    },
+
+    'tool.focus': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'focus', ref: p.ref, selector: p.selector });
+      return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, focused: r.focused });
+    },
+
+    'tool.blur': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'blur', ref: p.ref, selector: p.selector });
+      return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, was_focused: r.wasFocused, focused: r.focused });
+    },
+
+    'tool.wheel': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'wheel', ref: p.ref, selector: p.selector, deltaX: p.delta_x, deltaY: p.delta_y, modifiers: p.modifiers });
+      return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, x: r.x, y: r.y, delta_x: r.deltaX, delta_y: r.deltaY });
+    },
+
+    // Safari's tab API only reports loading/complete, so every phase after
+    // `commit` is "tab status is complete". `networkidle` adds a fixed
+    // quiet period because there are no network events to watch.
+    // ponytail: approximates networkidle; real idle detection would need the
+    // (unavailable) network layer. Also: a call made *before* a navigation
+    // has started sees the old page's 'complete' and returns at once.
+    'tool.wait_for_navigation': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const want = p.wait_until || 'load';
+      const deadline = Date.now() + (p.timeout_ms || 30000);
+      const live = () => browser.tabs.get(tabId).catch(() => null);
+      let tab = await live();
+      const done = () => want === 'commit' || tab.status === 'complete';
+      while (tab && !done() && Date.now() < deadline) { await sleep(250); tab = await live(); }
+      if (!tab) throw { code: 'not_found', message: `tab ${tabId} was closed while waiting` };
+      if (done() && want === 'networkidle') await sleep(500);
+      return withDialogs({ tab_id: tabId, reached: done() ? want : 'timeout' });
     },
 
     'tool.click': async (p) => {

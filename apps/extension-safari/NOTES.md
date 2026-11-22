@@ -70,3 +70,18 @@ The daemon checks for new `bsk` releases and, by default, replaces its own binar
 - Quick check that the running binary is patched: `strings $(which bsk) | grep -c safari-web-extension` (non-zero = patched), or probe the handshake: `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:52800/extension -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Origin: safari-web-extension://3610fd31-0161-4c6b-919a-ee9a3edb2c19'` should print `101`, not `403`.
 - If it did get replaced: rebuild with `cargo build -p bsk`, `bsk daemon stop`, restart with the env var set.
 - Safari keeps an extension's error entries until the extension reloads, so a stale `ws error` can remain after the cause is fixed; quit and relaunch Safari (or untick/retick the extension) to clear it.
+
+## Command coverage vs the Chrome extension
+
+Safari has no debugger/CDP, so everything is done from a content script plus `browser.tabs`/`windows`. What's implemented lives in `background.js`'s `tools` table; page-side logic in `content.js`'s `ops`. Still `unsupported`: `upload`, `download`, `network`, `console`, `debug`, `record`, `evaluate`, `hover`, `request_help`.
+
+Candidates for next, roughly by effort: `evaluate`/`console` (needs injecting a script into the page's own world — blocked by strict CSP on some sites), then `network` (wrap `fetch`/XHR; misses images/scripts and anything before injection), `upload` (set a File on an input via `DataTransfer`), `hover` (synthetic mouse events only — CSS `:hover` won't trigger). Not feasible from an extension: `download` (no downloads API in Safari), dialog handling, trusted (`isTrusted`) input, moving a borrowed tab into the Agent Window.
+
+## Updating the notarized app after changing extension JS
+
+`rebuild.sh` starts with `rm -rf` on the wrapper folder — **including `export/`, the notarized app Safari may be using**. To ship a change without regenerating the project:
+1. Copy the changed files into `../extension-safari-wrapper/BrowserSkill for Safari/BrowserSkill for Safari Extension/Resources/`.
+2. Archive and export to a *new* folder (the commands under *Archive, sign, and export*, with a new `-archivePath` and `-exportPath`; use the system Xcode via `xcode-select -p`, not `Xcode-beta`, unless that's what's installed).
+3. Zip, `notarytool submit --wait`, `stapler staple` on the new export.
+4. Quit Safari, move the old `export/` aside, put the new one in place, and make sure it is the **only** registered copy: `pluginkit -mAvvv -p com.apple.Safari.web-extension | grep browserskill` (an `xcodebuild archive` registers its own build-intermediate copy under `DerivedData/…/ArchiveIntermediates/` — unregister that one with `lsregister -u` or Safari will load an un-notarized build). Re-register with `lsregister -f` on the new app.
+5. Relaunch Safari and re-tick the extension in Settings → Extensions (a re-registered extension comes back off).

@@ -10,9 +10,11 @@ This repo is just the extension — it doesn't carry BrowserSkill's own (large) 
 
 ## Status
 
-**Working end-to-end**, verified against a real `bsk daemon` and real Safari: `session start/stop`, `tab_list/create/close/select/borrow/return`, `navigate`, `snapshot`, `click`, `fill`, `press`, `scroll_to`, `screenshot`. Anything else in `bsk-protocol`'s `Method` enum (upload, download, network, console, debug, record, evaluate, hover, wheel, focus/blur, select, get_html, observe, wait_*, request_help) returns a clean `unsupported` RPC error rather than silently no-op'ing.
+**Working end-to-end**, verified against a real `bsk daemon` and real Safari: `session start/stop`, `tab_list/create/close/select/borrow/return`, `navigate`, `snapshot`, `observe`, `click`, `fill`, `press`, `select`, `focus`, `blur`, `wheel`, `scroll_to`, `get_html`, `wait_for_navigation`, `screenshot`. Anything else in `bsk-protocol`'s `Method` enum (upload, download, network, console, debug, record, evaluate, hover, request_help) returns a clean `unsupported` RPC error rather than silently no-op'ing.
 
-19/19 Node tests pass (`test/`), plus the page-driver logic (`content.js`) has been exercised live against real DOM. The toolbar icon's popup (`popup.html`) shows daemon connection + session status read-only by design: a popup-side "turn control off" would only stop *new* commands — the daemon keeps its socket either way — so it would be theatre, not a kill switch.
+Caveats on the newer ones: `observe` is just `snapshot` (no hover probing or paging); `wheel` dispatches a synthetic wheel event and then scrolls the nearest scrollable element itself (unless the page cancelled the event); `wait_for_navigation` is based on Safari's tab loading/complete status, so `networkidle` is approximated with a fixed 500 ms quiet period and a call made *before* a navigation starts returns immediately.
+
+26/26 Node tests pass (`test/`), plus the page-driver logic (`content.js`) has been exercised live against real DOM. The toolbar icon's popup (`popup.html`) shows daemon connection + session status read-only by design: a popup-side "turn control off" would only stop *new* commands — the daemon keeps its socket either way — so it would be theatre, not a kill switch.
 
 ## Why Safari needed its own extension, not a port
 

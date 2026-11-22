@@ -70,6 +70,22 @@
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   }
 
+  // Focused element, descending into open shadow roots.
+  const activeElement = () => {
+    let a = document.activeElement;
+    while (a?.shadowRoot?.activeElement) a = a.shadowRoot.activeElement;
+    return a;
+  };
+
+  // Nearest ancestor that can actually scroll, else the page itself.
+  const scroller = (el) => {
+    for (let n = el; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      const s = getComputedStyle(n);
+      if (/(auto|scroll)/.test(s.overflowY + s.overflowX) && (n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth)) return n;
+    }
+    return window;
+  };
+
   const setValue = (el, v) => {
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
@@ -131,6 +147,54 @@
       el.scrollIntoView({ block: 'center', inline: 'center' });
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height, usedRef, usedSelector };
+    },
+    getHtml: (m) => {
+      const { el, usedRef, usedSelector } = m.ref || m.selector ? resolve(m) : { el: document.documentElement };
+      const bytes = new TextEncoder().encode(el.outerHTML);
+      const max = m.maxBytes || 524288;
+      const truncated = bytes.length > max;
+      const html = truncated ? new TextDecoder().decode(bytes.slice(0, max)) : el.outerHTML;
+      return { html, truncated, byteSize: bytes.length, usedRef, usedSelector };
+    },
+    select: (m) => {
+      const { el, usedRef, usedSelector } = resolve(m);
+      if (el.tagName !== 'SELECT') throw { code: 'invalid_params', message: 'target is not a <select>' };
+      const values = m.values || [];
+      if (!el.multiple && values.length !== 1) throw { code: 'invalid_params', message: 'a single-select needs exactly one value' };
+      const missing = values.find((v) => ![...el.options].some((o) => o.value === v));
+      if (missing !== undefined) throw { code: 'not_found', message: `no option with value ${JSON.stringify(missing)}` };
+      for (const o of el.options) o.selected = values.includes(o.value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      const sel = [...el.selectedOptions];
+      return { usedRef, usedSelector, multiple: el.multiple, selectedValues: sel.map((o) => o.value), selectedLabels: sel.map((o) => o.label) };
+    },
+    focus: (m) => {
+      const { el, usedRef, usedSelector } = resolve(m);
+      el.focus();
+      return { usedRef, usedSelector, focused: activeElement() === el };
+    },
+    blur: (m) => {
+      const { el, usedRef, usedSelector } = resolve(m);
+      const wasFocused = activeElement() === el;
+      el.blur();
+      return { usedRef, usedSelector, wasFocused, focused: activeElement() === el };
+    },
+    // A synthetic WheelEvent (untrusted) does not scroll anything by itself,
+    // so after dispatching it for the page's own handlers we scroll the
+    // nearest scrollable ancestor ourselves — unless a handler cancelled it.
+    wheel: (m) => {
+      let el, usedRef, usedSelector, x = innerWidth / 2, y = innerHeight / 2;
+      if (m.ref || m.selector) { ({ el, usedRef, usedSelector } = resolve(m)); ({ x, y } = centerOf(el)); }
+      const target = document.elementFromPoint(x, y) || el || document.body;
+      const mods = m.modifiers || [];
+      const dx = m.deltaX || 0, dy = m.deltaY || 0;
+      const notCancelled = target.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true, cancelable: true, clientX: x, clientY: y, deltaX: dx, deltaY: dy, deltaMode: 0,
+        ctrlKey: mods.includes('Control'), altKey: mods.includes('Alt'), shiftKey: mods.includes('Shift'), metaKey: mods.includes('Meta'),
+      }));
+      if (notCancelled) scroller(target).scrollBy({ left: dx, top: dy, behavior: 'instant' });
+      return { usedRef, usedSelector, x, y, deltaX: dx, deltaY: dy };
     },
     // captureVisibleTab returns a PNG at device pixels; this reports its
     // actual dimensions so background.js can fill ScreenshotResult's
