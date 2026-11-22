@@ -1,15 +1,16 @@
 import {
-  type CdpDebuggee,
   parseConsoleApiCalled,
   parseExceptionThrown,
   parseLogEntry,
 } from "@/browser-driver/chromium-cdp";
+import { rootEventSource, type TabEventSource } from "@/browser-driver/frame-handles";
 import {
   isAgentControlledTab,
   type SessionContext,
   type SessionManager,
 } from "@/session-manager/manager";
 import type { CdpRunner, ChromeTabsApi } from "@/tools/shared";
+import { methods } from "@/transport/generated/methods";
 import type { RequestFrame } from "@/transport/types";
 import { type DebugArchive, HISTORY_LIMIT } from "./archive";
 import { debugCapabilities } from "./capabilities";
@@ -39,31 +40,20 @@ const MAX_OPERATIONS = 64;
 const MAX_CONSOLE = 100;
 const WINDOW_MS = 1500;
 const OBSERVE_MS = 15000;
-const ACTIONS = new Set([
-  "tool.navigate",
-  "tool.navigate_back",
-  "tool.navigate_forward",
-  "tool.reload",
-  "tool.click",
-  "tool.fill",
-  "tool.press",
-  "tool.select",
-  "tool.hover",
-  "tool.evaluate",
-  "tool.wheel",
-  "tool.scroll_to",
-  "tool.focus",
-  "tool.blur",
-]);
+const ACTIONS = new Set<string>(
+  methods
+    .filter((entry) => entry.owner === "extension" && entry.debug_evidence !== "none")
+    .map((entry) => entry.method),
+);
 
 export interface DebugCdp extends CdpRunner {
   ensureNetworkCapture(tabId: number): Promise<void>;
-  sendAttached<T = unknown>(
-    target: CdpDebuggee & { tabId: number },
+  sendToEventSource<T = unknown>(
+    source: TabEventSource,
     method: string,
     params?: object,
   ): Promise<T>;
-  getFrameGraph?: CdpRunner["getFrameGraph"];
+  discoverChildEventSources?(tabId: number): Promise<TabEventSource[]>;
 }
 interface RunState {
   run: DebugRun;
@@ -72,6 +62,7 @@ interface RunState {
   controls?: DebugNetworkControl;
   journal?: DebugJournal;
   controlCleanup?: Promise<void>;
+  subscription?: { dispose(): void };
   operations: DebugOperation[];
   console: DebugConsole[];
   timer?: ReturnType<typeof setTimeout>;
@@ -127,7 +118,6 @@ export class DebugManager {
   // Only lightweight ownership outlives the live cache. Object identity prevents
   // a reused short session ID from inheriting another task's saved evidence.
   private readonly ownedRuns = new WeakMap<SessionContext, Map<string, number>>();
-  private subscription?: { dispose(): void };
   private readonly starting = new Set<SessionContext>();
   // Starts awaiting cleanup still occupy a slot before their RunState is registered.
   private reservedStarts = 0;
@@ -253,19 +243,10 @@ export class DebugManager {
       const network = new DebugNetworkStore(
         id,
         {
-          send: async <T>(targetTab: number, method: string, params?: object) => {
-            if (!this.owned(sessionId, targetTab) || state.run.state !== "capturing")
+          sendToEventSource: async <T>(source: TabEventSource, method: string, params?: object) => {
+            if (!this.owned(sessionId, source.tabId) || state.run.state !== "capturing")
               throw new Error("capture stopped");
-            return deadline(this.cdp.sendAttached<T>({ tabId: targetTab }, method, params), 2500);
-          },
-          sendToTarget: async <T>(
-            target: CdpDebuggee & { tabId: number },
-            method: string,
-            params?: object,
-          ) => {
-            if (!this.owned(sessionId, target.tabId) || state.run.state !== "capturing")
-              throw new Error("capture stopped");
-            return deadline(this.cdp.sendAttached<T>(target, method, params), 2500);
+            return deadline(this.cdp.sendToEventSource<T>(source, method, params), 2500);
           },
         },
         () => this.change(state),
@@ -311,7 +292,7 @@ export class DebugManager {
       ownedRuns.set(id, tabId);
       while (ownedRuns.size > HISTORY_LIMIT + MAX_RUNS)
         ownedRuns.delete(ownedRuns.keys().next().value!);
-      this.subscription ??= this.cdp.onEvent?.((source, method, params) =>
+      state.subscription = this.cdp.onEvent(tabId, (source, method, params) =>
         this.onEvent(source, method, params),
       );
       try {
@@ -322,27 +303,28 @@ export class DebugManager {
           throw new Error("debug tab must remain in its Agent Window");
         if (!this.runs.has(id) || state.run.state !== "capturing")
           throw new Error("capture stopped during debug start");
-        this.cdp.trackSessionTab?.(sessionId, tabId);
+        this.cdp.trackSessionTab(sessionId, tabId);
         await wait(this.cdp.ensureNetworkCapture(tabId));
         if (!this.owned(sessionId, tabId) || !this.runs.has(id))
           throw new Error("task ended during debug start");
         if (state.run.state !== "capturing") return this.summary(state);
-        await wait(this.enableTarget(state, { tabId }, startup.signal));
+        await wait(this.enableTarget(state, rootEventSource(tabId), startup.signal));
         if (state.run.state !== "capturing") return this.summary(state);
-        const graph = await wait(
+        const childSources = await wait(
           Promise.resolve(
-            this.cdp.getFrameGraph?.(tabId).catch(() => {
+            this.cdp.discoverChildEventSources?.(tabId).catch(() => {
               this.coverage(state, "child_capture_partial");
               return undefined;
             }),
           ),
         );
-        if (graph) {
-          // Frame graph discovery already belongs to the driver. Debug adds only
+        if (childSources) {
+          // Child target discovery already belongs to the driver. Debug adds only
           // bounded Network/Runtime listeners on its existing child attachments.
-          const targets = new Map<string, CdpDebuggee & { tabId: number }>();
-          for (const frame of graph.frames)
-            if (frame.target.sessionId) targets.set(frame.target.sessionId, frame.target);
+          const targets = new Map<string, TabEventSource>();
+          for (const childSource of childSources) {
+            if (!childSource.isRootTarget) targets.set(childSource.targetKey, childSource);
+          }
           await wait(
             Promise.all(
               [...targets.values()]
@@ -389,10 +371,10 @@ export class DebugManager {
 
   private async enableTarget(
     state: RunState,
-    target: CdpDebuggee & { tabId: number },
+    target: TabEventSource,
     signal?: AbortSignal,
   ): Promise<void> {
-    const key = target.sessionId ?? "root";
+    const key = target.targetKey;
     if (
       state.targets.has(key) ||
       state.run.state !== "capturing" ||
@@ -406,7 +388,7 @@ export class DebugManager {
     state.targets.add(key);
     try {
       await deadline(
-        this.cdp.sendAttached(target, "Network.enable", {
+        this.cdp.sendToEventSource(target, "Network.enable", {
           maxTotalBufferSize: 2 * 1024 * 1024,
           maxResourceBufferSize: 256 * 1024,
           maxPostDataSize: 64 * 1024,
@@ -414,12 +396,26 @@ export class DebugManager {
         2500,
         signal,
       );
+      // The driver attaches with Runtime off, so the root needs it here too:
+      // the observer tracks its world through context events and bindings
+      // only reach new documents while Runtime is on.
+      if (state.run.state === "capturing" && this.owned(state.run.session_id, target.tabId))
+        await deadline(this.cdp.sendToEventSource(target, "Runtime.enable"), 2500, signal);
+      // Root attachment no longer enables Log implicitly. Preserve browser
+      // diagnostics in debug recordings without making Log a startup requirement.
       if (
-        target.sessionId &&
+        target.isRootTarget &&
         state.run.state === "capturing" &&
-        this.owned(state.run.session_id, target.tabId)
-      )
-        await deadline(this.cdp.sendAttached(target, "Runtime.enable"), 2500, signal);
+        this.owned(state.run.session_id, target.tabId) &&
+        !signal?.aborted
+      ) {
+        try {
+          await deadline(this.cdp.sendToEventSource(target, "Log.enable"), 2500, signal);
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          this.coverage(state, "browser_log_capture_unavailable");
+        }
+      }
       if (state.run.state === "capturing" && !signal?.aborted)
         await deadline(Promise.resolve(state.controls?.target(target)), 2500, signal);
     } catch (error) {
@@ -435,20 +431,19 @@ export class DebugManager {
     }
   }
 
-  private onEvent(source: CdpDebuggee, method: string, params: unknown): void {
+  private onEvent(source: TabEventSource, method: string, params: unknown): void {
     if (typeof source.tabId !== "number") return;
     for (const state of this.runs.values()) {
       if (state.run.tab_id !== source.tabId) continue;
       if (state.run.state !== "capturing") {
-        if (state.controlCleanup)
-          state.controls?.onEvent({ ...source, tabId: source.tabId }, method, params);
+        if (state.controlCleanup) state.controls?.onEvent(source, method, params);
         continue;
       }
       if (!this.owned(state.run.session_id, source.tabId)) {
         this.stopState(state, "tab_released");
         continue;
       }
-      if (!source.sessionId) {
+      if (source.isRootTarget) {
         state.observer?.contextEvent(method, params);
         if (
           method === "Page.frameStartedLoading" &&
@@ -467,24 +462,22 @@ export class DebugManager {
           continue;
         }
       }
-      if (method === "Target.attachedToTarget") {
-        const child = params as { sessionId?: string; targetInfo?: { type?: string } };
-        if (child.sessionId && child.targetInfo?.type === "iframe")
-          void this.enableTarget(state, { tabId: source.tabId, sessionId: child.sessionId }).catch(
-            () => this.coverage(state, "child_capture_partial"),
-          );
+      if (method === "BskDriver.childTargetAttached" && !source.isRootTarget) {
+        void this.enableTarget(state, source).catch(() =>
+          this.coverage(state, "child_capture_partial"),
+        );
+        continue;
       }
-      if (method === "Target.detachedFromTarget") {
-        const child = params as { sessionId?: string };
-        if (child.sessionId) {
-          state.targets.delete(child.sessionId);
-          state.network.detachTarget(child.sessionId);
-          state.controls?.detach(child.sessionId);
-        }
+      if (method === "BskDriver.childTargetDetached" && !source.isRootTarget) {
+        state.targets.delete(source.targetKey);
+        state.network.detachTarget(source.targetKey);
+        state.controls?.detach(source.targetKey);
+        continue;
       }
-      if (!source.sessionId && method === "Page.loadEventFired") void this.capturePage(state, true);
-      state.network.onEvent({ ...source, tabId: source.tabId }, method, params);
-      state.controls?.onEvent({ ...source, tabId: source.tabId }, method, params);
+      if (source.isRootTarget && method === "Page.loadEventFired")
+        void this.capturePage(state, true);
+      state.network.onEvent(source, method, params);
+      state.controls?.onEvent(source, method, params);
       if (method === "Network.loadingFinished") this.scheduleObservation(state);
       const parsed =
         method === "Runtime.consoleAPICalled"
@@ -831,9 +824,9 @@ export class DebugManager {
     try {
       const [tree, tab, fieldValues] = await deadline(
         Promise.all([
-          this.cdp.sendAttached<{
+          this.cdp.sendToEventSource<{
             nodes: { ignored?: boolean; role?: { value?: string }; name?: { value?: string } }[];
-          }>({ tabId: state.run.tab_id }, "Accessibility.getFullAXTree"),
+          }>(rootEventSource(state.run.tab_id), "Accessibility.getFullAXTree"),
           this.tabs.get(state.run.tab_id),
           state.observer?.call("snapshot").catch(() => undefined),
         ]),
@@ -916,24 +909,28 @@ export class DebugManager {
           })
           .finally(() => {
             state.controlCleanup = undefined;
+            state.subscription?.dispose();
+            state.subscription = undefined;
             this.pruneListener();
             state.network.checkpoint();
             void this.persist(state);
           })
       : undefined;
+    if (!state.controlCleanup) {
+      state.subscription?.dispose();
+      state.subscription = undefined;
+    }
     state.network.stop(reason);
     this.change(state);
     void this.persist(state);
     this.pruneListener();
   }
   private pruneListener(): void {
-    if (
-      ![...this.runs.values()].some(
-        ({ run, controlCleanup }) => run.state === "capturing" || controlCleanup,
-      )
-    ) {
-      this.subscription?.dispose();
-      this.subscription = undefined;
+    for (const state of this.runs.values()) {
+      if (state.run.state !== "capturing" && !state.controlCleanup) {
+        state.subscription?.dispose();
+        state.subscription = undefined;
+      }
     }
   }
   stopTab(tabId: number, reason = "tab_released"): void {
@@ -1243,7 +1240,11 @@ export class DebugManager {
     this.runs.delete(id);
   }
 
-  async read(params: DebugParams, signal?: AbortSignal): Promise<DebugResult> {
+  async read(
+    params: DebugParams,
+    signal?: AbortSignal,
+    mutate: <T>(operation: () => Promise<T>) => Promise<T> = (operation) => operation(),
+  ): Promise<DebugResult> {
     this.sync();
     const context = this.sessions.get(params.session_id);
     if (!context) throw new Error("session not found");
@@ -1357,21 +1358,28 @@ export class DebugManager {
         tab.windowId !== this.sessions.get(params.session_id)?.agentWindowId
       )
         throw new Error("debug tab must remain in its Agent Window");
+      if (params.tab_id !== undefined && params.tab_id !== state.run.tab_id)
+        throw new Error("Network controls must target the observed debug tab");
       if (signal?.aborted) throw new Error("debug action cancelled");
-      if (params.action === "rule_add") await state.controls.add(params.rule!, signal);
+      if (params.action === "rule_add")
+        await mutate(() => state.controls!.add(params.rule!, signal));
       else if (params.action === "replay") {
         await state.journal?.flush();
         const saved = await this.archive?.request?.(state.run.id, params.id!);
         const current = state.network.get(params.id!);
         const source = current ? mergeRequest(saved, current) : saved;
         if (!source) throw new Error("request not found or evicted");
-        const replay = await state.controls.replay(source, params.replay!, tab.url ?? "", signal);
+        const replay = await mutate(() =>
+          state.controls!.replay(source, params.replay!, tab.url ?? "", signal),
+        );
         return { ...result, run: this.summary(state), replay };
       } else
-        await state.controls.update(
-          params.id!,
-          params.action as "rule_enable" | "rule_disable" | "rule_remove",
-          signal,
+        await mutate(() =>
+          state.controls!.update(
+            params.id!,
+            params.action as "rule_enable" | "rule_disable" | "rule_remove",
+            signal,
+          ),
         );
       return { ...result, run: this.summary(state), rules: state.controls.list() };
     }

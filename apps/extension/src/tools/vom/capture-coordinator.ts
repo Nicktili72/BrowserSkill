@@ -1,13 +1,17 @@
 import { CdpReadTimeoutError } from "@/browser-driver/command-deadline";
 import {
-  type CdpFrame,
-  type CdpFrameGraph,
-  type CdpTarget,
-  cdpTargetKey,
-  omitFrameSubtrees,
-} from "@/browser-driver/frame-graph";
+  type FrameDocumentGraph,
+  type FrameDocumentInfo,
+  type FrameProcessBoundary,
+  frameProcessBoundary,
+  frameProcessIdentityKey,
+  omitFrameDocumentSubtrees,
+  rootProcessBoundary,
+  toFrameDocumentHandle,
+  type UnavailableFrameDocument,
+} from "@/browser-driver/frame-handles";
 import { cssViewport, GeometryContext } from "../geometry/frame-context";
-import { type CdpRunner, cdpRunnerForTarget } from "../shared";
+import { type CdpRunner, cdpRunnerForFrame } from "../shared";
 import { collectOverlayExcludedBackendIds } from "./capture";
 import {
   isCaptureTerminalError as isCaptureAbort,
@@ -23,7 +27,12 @@ import {
   type FrameDocument,
   type FrameOwnedAxNode,
 } from "./frame-document";
-import { type PreparedFrameDocument, prepareSnapshot, projectSnapshot } from "./normalize";
+import {
+  finalizeDocumentHiddenExclusions,
+  type PreparedFrameDocument,
+  prepareSnapshot,
+  projectSnapshot,
+} from "./normalize";
 import {
   BASIC_SNAPSHOT,
   describeSnapshotFrames,
@@ -32,8 +41,8 @@ import {
 } from "./snapshot";
 
 interface TargetBatch<T extends FrameOwnedAxNode> {
-  target: CdpTarget;
-  frames: CdpFrame[];
+  process: FrameProcessBoundary;
+  frames: FrameDocumentInfo[];
   snapshotAttachmentId?: string;
   documents: PreparedFrameDocument[];
   ax: FrameAxBatch<T>[];
@@ -41,6 +50,15 @@ interface TargetBatch<T extends FrameOwnedAxNode> {
   snapshotFrameIds?: Set<string>;
   rootFrameId?: string;
 }
+
+/**
+ * Stable message for an observation whose root document identity could
+ * not be (re)verified. `observation.ts` matches on this marker to detect
+ * the anti-debugging reload loop, where a site reloads itself as soon
+ * as the debugger attaches (GitHub issues #454 and #465).
+ */
+export const OBSERVE_IDENTITY_CHANGED =
+  "observation document identity changed or could not be verified; observe again";
 
 /** A fixed worker pool scoped to one capture; each worker issues at most one
  * collection request at a time. Geometry has its own measurement-phase bound. */
@@ -71,26 +89,330 @@ async function collectTasks<T>(
   if (failed) throw failure;
 }
 
-export async function captureObservationFacts<T extends FrameOwnedAxNode>(
+export const ACCESSIBILITY_LEASE_TTL_MS = 10_000;
+
+interface LeasedAccessibilityTarget {
+  process: FrameProcessBoundary;
+  attachmentId: string;
+  needsEnable: boolean;
+}
+
+const leasesByTab = new Map<number, Set<AccessibilityLease>>();
+
+function registerTabLease(tabId: number, lease: AccessibilityLease): void {
+  let set = leasesByTab.get(tabId);
+  if (!set) {
+    set = new Set();
+    leasesByTab.set(tabId, set);
+  }
+  set.add(lease);
+}
+
+function unregisterTabLease(tabId: number, lease: AccessibilityLease): void {
+  const set = leasesByTab.get(tabId);
+  if (!set) return;
+  set.delete(lease);
+  if (set.size === 0) leasesByTab.delete(tabId);
+}
+
+function isProcessLeased(
+  tabId: number,
+  process: FrameProcessBoundary,
+  attachmentId: string,
+): boolean {
+  const set = leasesByTab.get(tabId);
+  if (!set) return false;
+  for (const lease of set) {
+    if (lease.holdsAttachment(process, attachmentId)) return true;
+  }
+  return false;
+}
+
+/**
+ * Sliding idle lease for `Accessibility.enable` across back-to-back cooperative
+ * captures on the same tab/attachment. Avoids tearing down and rebuilding
+ * Blink's full renderer AX tree on every sync/verify cycle while still
+ * disabling the domain after idle expiry, session stop, tab release, or error.
+ */
+export class AccessibilityLease {
+  private readonly entries = new Map<string, LeasedAccessibilityTarget>();
+  private cdp?: CdpRunner;
+  private timer?: ReturnType<typeof setTimeout>;
+  private activeUsers = 0;
+  private disposed = false;
+
+  constructor(
+    readonly tabId: number,
+    private readonly ttlMs = ACCESSIBILITY_LEASE_TTL_MS,
+  ) {}
+
+  hasActive(process: FrameProcessBoundary, attachmentId: string | undefined): boolean {
+    if (this.disposed || attachmentId === undefined) return false;
+    const entry = this.entries.get(frameProcessIdentityKey(process));
+    return entry !== undefined && entry.attachmentId === attachmentId && !entry.needsEnable;
+  }
+
+  holdsAttachment(process: FrameProcessBoundary, attachmentId: string): boolean {
+    if (this.disposed) return false;
+    const entry = this.entries.get(frameProcessIdentityKey(process));
+    return entry !== undefined && entry.attachmentId === attachmentId;
+  }
+
+  beginUse(): void {
+    this.activeUsers++;
+    this.clearTimer();
+  }
+
+  endUse(): void {
+    if (this.activeUsers > 0) this.activeUsers--;
+    this.syncState();
+  }
+
+  markNeedsEnable(): void {
+    for (const entry of this.entries.values()) {
+      entry.needsEnable = true;
+    }
+  }
+
+  forgetTimedOut(error: CdpReadTimeoutError): void {
+    if (error.tabId !== this.tabId) return;
+    for (const [key, entry] of this.entries) {
+      if (
+        !error.processKey ||
+        error.processKey === "root" ||
+        entry.process.processKey === error.processKey
+      ) {
+        this.entries.delete(key);
+      }
+    }
+    this.syncState();
+  }
+
+  retain(
+    cdp: CdpRunner,
+    enabled: ReadonlyMap<FrameProcessBoundary, string | undefined>,
+  ): Map<FrameProcessBoundary, string | undefined> {
+    const unretained = new Map<FrameProcessBoundary, string | undefined>();
+    if (this.disposed) {
+      for (const [process, attachmentId] of enabled) unretained.set(process, attachmentId);
+      return unretained;
+    }
+    const currentAttachmentId = cdp.getAttachmentId(this.tabId);
+    for (const [key, entry] of this.entries) {
+      if (entry.attachmentId !== currentAttachmentId) {
+        this.entries.delete(key);
+        unretained.set(entry.process, entry.attachmentId);
+      }
+    }
+    for (const [process, attachmentId] of enabled) {
+      if (attachmentId !== undefined && attachmentId === currentAttachmentId) {
+        this.entries.set(frameProcessIdentityKey(process), {
+          process,
+          attachmentId,
+          needsEnable: false,
+        });
+      } else {
+        unretained.set(process, attachmentId);
+      }
+    }
+    this.cdp = cdp;
+    this.syncState();
+    return unretained;
+  }
+
+  takeEntries(): Map<FrameProcessBoundary, string | undefined> {
+    this.clearTimer();
+    unregisterTabLease(this.tabId, this);
+    const drained = new Map<FrameProcessBoundary, string | undefined>();
+    for (const entry of this.entries.values()) {
+      drained.set(entry.process, entry.attachmentId);
+    }
+    this.entries.clear();
+    return drained;
+  }
+
+  async release(cdpOverride?: CdpRunner): Promise<void> {
+    const runner = cdpOverride ?? this.cdp;
+    const drained = this.takeEntries();
+    if (drained.size > 0 && runner) {
+      await releaseAccessibility(runner, this.tabId, drained);
+    }
+  }
+
+  async dispose(cdpOverride?: CdpRunner): Promise<void> {
+    this.disposed = true;
+    await this.release(cdpOverride);
+  }
+
+  private clearTimer(): void {
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  private syncState(): void {
+    this.clearTimer();
+    if (this.disposed || this.entries.size === 0 || !this.cdp) {
+      unregisterTabLease(this.tabId, this);
+      return;
+    }
+    registerTabLease(this.tabId, this);
+    if (this.activeUsers > 0) return;
+    const runner = this.cdp;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      const drained = this.takeEntries();
+      if (drained.size > 0) {
+        void releaseAccessibility(runner, this.tabId, drained);
+      }
+    }, this.ttlMs);
+    (this.timer as { unref?: () => void }).unref?.();
+  }
+}
+
+/** `Accessibility.enable` keeps the renderer's accessibility tree live, updated
+ * and reported on every page change, until the domain is disabled again. A
+ * capture needs it only for its own reads, so each target that enabled it
+ * disables it again under the same worker bound. Like other cleanup, this
+ * never reconnects a replaced attachment, and nothing is queued behind a read
+ * still running past its deadline. The driver's cleanup deadline also bounds
+ * a disable command if the renderer stops responding after the AX reads. */
+async function releaseAccessibility(
+  cdp: CdpRunner,
+  tabId: number,
+  enabled: ReadonlyMap<FrameProcessBoundary, string | undefined>,
+): Promise<void> {
+  await collectTasks([...enabled], async ([process, attachmentId]) => {
+    // A detach already disabled every domain of that attachment.
+    if (cdp.getAttachmentId(tabId) !== attachmentId) return;
+    if (attachmentId !== undefined && isProcessLeased(tabId, process, attachmentId)) return;
+    await cdp
+      .sendToFrame(
+        process.rootHandle,
+        "Accessibility.disable",
+        {},
+        {
+          ...(attachmentId !== undefined ? { attachmentId } : {}),
+          allowReattach: false,
+          ignoreFrameNavigation: true,
+        },
+      )
+      .catch(() => {});
+  });
+}
+
+/** Never queue cleanup behind a timed-out read. A pending root command gates
+ * every frame on the tab; a child command gates only its original target. */
+function forgetPendingAccessibility(
+  tabId: number,
+  enabled: Map<FrameProcessBoundary, string | undefined>,
+  error: unknown,
+): void {
+  if (!(error instanceof CdpReadTimeoutError)) return;
+  for (const process of enabled.keys()) {
+    if (
+      !error.processKey ||
+      error.processKey === "root" ||
+      process.processKey === error.processKey
+    ) {
+      enabled.delete(process);
+    }
+  }
+  const leases = leasesByTab.get(tabId);
+  if (leases) {
+    for (const lease of [...leases]) lease.forgetTimedOut(error);
+  }
+}
+
+export function captureObservationFacts<T extends FrameOwnedAxNode>(
   cdp: CdpRunner,
   tabId: number,
   signal?: AbortSignal,
   pageUrl?: string,
-  options: { includeVisualFacts?: boolean } = {},
+  options: { includeVisualFacts?: boolean; accessibilityLease?: AccessibilityLease } = {},
+): Promise<ObservationFacts<T>> {
+  return withObservationFacts(
+    cdp,
+    tabId,
+    (facts: ObservationFacts<T>) => facts,
+    signal,
+    pageUrl,
+    options,
+  );
+}
+
+/** Keep Accessibility enabled through the consumer's remaining reads, including
+ * hover probes. Cleanup can close the read gate until Chrome replies, so it
+ * must follow the entire observation, even when the consumer fails or aborts. */
+export async function withObservationFacts<T extends FrameOwnedAxNode, R>(
+  cdp: CdpRunner,
+  tabId: number,
+  consume: (facts: ObservationFacts<T>) => R | Promise<R>,
+  signal?: AbortSignal,
+  pageUrl?: string,
+  options: { includeVisualFacts?: boolean; accessibilityLease?: AccessibilityLease } = {},
+): Promise<R> {
+  const axEnabled = new Map<FrameProcessBoundary, string | undefined>();
+  const lease = options.accessibilityLease;
+  lease?.beginUse();
+  let toRelease = axEnabled;
+  let result: R;
+  try {
+    const facts = await collectObservationFacts<T>(cdp, tabId, axEnabled, signal, pageUrl, options);
+    throwCaptureAborted(signal);
+    result = await consume(facts);
+    throwCaptureAborted(signal);
+    if (lease) {
+      toRelease = lease.retain(cdp, axEnabled);
+    }
+  } catch (error) {
+    forgetPendingAccessibility(tabId, axEnabled, error);
+    if (lease) {
+      const seenKeys = new Set([...axEnabled.keys()].map(frameProcessIdentityKey));
+      for (const [process, attachmentId] of lease.takeEntries()) {
+        if (!seenKeys.has(frameProcessIdentityKey(process))) {
+          axEnabled.set(process, attachmentId);
+        }
+      }
+    }
+    throw error;
+  } finally {
+    lease?.endUse();
+    if (toRelease.size > 0) {
+      await releaseAccessibility(cdp, tabId, toRelease);
+    }
+  }
+  if (signal?.aborted && lease) {
+    await lease.release(cdp);
+  }
+  throwCaptureAborted(signal);
+  return result;
+}
+
+async function collectObservationFacts<T extends FrameOwnedAxNode>(
+  cdp: CdpRunner,
+  tabId: number,
+  axEnabled: Map<FrameProcessBoundary, string | undefined>,
+  signal: AbortSignal | undefined,
+  pageUrl: string | undefined,
+  options: { includeVisualFacts?: boolean; accessibilityLease?: AccessibilityLease },
 ): Promise<ObservationFacts<T>> {
   const profile = options.includeVisualFacts ? VISUAL_SNAPSHOT : BASIC_SNAPSHOT;
   const startedAt = Date.now();
   throwCaptureAborted(signal);
-  let graph: CdpFrameGraph | undefined;
+  let graph: FrameDocumentGraph | undefined;
   try {
-    graph = await cdp.getFrameGraph?.(tabId);
+    graph = await cdp.getFrameDocuments(tabId, signal);
   } catch (error) {
+    forgetPendingAccessibility(tabId, axEnabled, error);
     if (isCaptureAbort(error)) throw error;
   }
   throwCaptureAborted(signal);
   const geometry = new GeometryContext(cdp, tabId, graph, signal);
   const issues: CaptureIssue[] = (graph?.unavailableFrames ?? []).map((frame) => ({
-    target: frame.target,
+    tabId,
+    processKey: frame.processKey,
     frameId: frame.frameId,
     stage: "dom",
     reason: "capture-unavailable",
@@ -99,57 +421,81 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   const graphFrames = new Map(graph?.frames.map((frame) => [frame.frameId, frame]) ?? []);
   const groups = new Map<string, TargetBatch<T>>();
   for (const frame of graph?.frames ?? []) {
-    const key = cdpTargetKey(frame.target);
+    const process = frameProcessBoundary(frame);
+    const key = frameProcessIdentityKey(process);
+    const isTargetRoot =
+      !frame.parentFrameId || graphFrames.get(frame.parentFrameId)?.processKey !== frame.processKey;
     let group = groups.get(key);
     if (!group) {
       group = {
-        target: frame.target,
+        process,
         frames: [],
         documents: [],
         ax: [],
         fallbackExcluded: new Set(),
       };
       groups.set(key, group);
+    } else if (process.isOutOfProcess && isTargetRoot) {
+      group.process = process;
     }
     group.frames.push(
-      !frame.target.sessionId && frame.frameId === graph?.rootFrameId && !frame.url && pageUrl
+      !frame.isOutOfProcess && frame.frameId === graph?.rootFrameId && !frame.url && pageUrl
         ? { ...frame, url: pageUrl }
         : frame,
     );
   }
-  if (!groups.has(cdpTargetKey({ tabId })))
-    groups.set(cdpTargetKey({ tabId }), {
-      target: { tabId },
+  const rootProcess = rootProcessBoundary(tabId);
+  if (!groups.has(frameProcessIdentityKey(rootProcess))) {
+    groups.set(frameProcessIdentityKey(rootProcess), {
+      process: rootProcess,
       frames: [],
       documents: [],
       ax: [],
       fallbackExcluded: new Set(),
     });
+  }
   const batches = [...groups.values()];
   const unavailable = (batch: TargetBatch<T>, stage: CaptureIssue["stage"], frameId?: string) =>
-    issues.push({ target: batch.target, frameId, stage, reason: "capture-unavailable" });
+    issues.push({
+      tabId: batch.process.tabId,
+      processKey: batch.process.processKey,
+      frameId,
+      stage,
+      reason: "capture-unavailable",
+    });
   let firstFailure: unknown;
-  const axReady = new Set<TargetBatch<T>>();
   const stopped = new Set<TargetBatch<T>>();
   const isolateChildTimeout = (error: unknown, batch: TargetBatch<T>): boolean => {
     if (
       !(error instanceof CdpReadTimeoutError) ||
-      !batch.target.sessionId ||
-      !error.sessionId ||
+      !batch.process.isOutOfProcess ||
+      !error.processKey ||
+      error.processKey === "root" ||
       error.tabId !== tabId
     )
       return false;
-    const failed = batches.find((item) => item.target.sessionId === error.sessionId);
+    const failed = batches.find((item) => item.process.processKey === error.processKey);
     if (!failed) return false;
     // Projection of a nested OOPIF can fail in an ancestor's session. Omit
     // that dependency subtree as well, without turning it into a root failure.
-    const omitted = omitFrameSubtrees(
+    const omitted = omitFrameDocumentSubtrees(
       { rootFrameId: graph?.rootFrameId ?? "root", frames: batches.flatMap((item) => item.frames) },
-      new Map([...failed.frames, ...batch.frames].map((frame) => [frame.frameId, frame.target])),
+      new Map<string, UnavailableFrameDocument>(
+        [...failed.frames, ...batch.frames].map((frame) => [
+          frame.frameId,
+          {
+            frameId: frame.frameId,
+            ...(frame.parentFrameId ? { parentFrameId: frame.parentFrameId } : {}),
+            ...(frame.url ? { url: frame.url } : {}),
+            processKey: frame.processKey,
+            isOutOfProcess: frame.isOutOfProcess,
+          },
+        ]),
+      ),
     );
     for (const frame of omitted.unavailableFrames ?? []) unavailableFrameIds.add(frame.frameId);
     for (const item of batches) {
-      if (!item.target.sessionId) continue;
+      if (!item.process.isOutOfProcess) continue;
       if (item !== batch && !item.frames.some((frame) => unavailableFrameIds.has(frame.frameId)))
         continue;
       if (!stopped.has(item)) unavailable(item, "dom");
@@ -161,19 +507,22 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
     batches,
     async (batch) => {
       if (stopped.has(batch)) return;
-      const scoped = cdpRunnerForTarget(cdp, batch.target);
+      const scoped = cdpRunnerForFrame(cdp, batch.process.rootHandle, {
+        ignoreFrameNavigation: true,
+        signal,
+      });
       try {
         throwCaptureAborted(signal);
         await scoped.send(tabId, "DOMSnapshot.enable", {});
         throwCaptureAborted(signal);
-        batch.snapshotAttachmentId = cdp.getAttachmentId?.(tabId);
+        batch.snapshotAttachmentId = cdp.getAttachmentId(tabId);
         const snapshot = await scoped.send<SnapshotReply>(tabId, "DOMSnapshot.captureSnapshot", {
           computedStyles: profile.computedStyles,
           includePaintOrder: true,
           includeDOMRects: true,
         });
         throwCaptureAborted(signal);
-        const observed = describeSnapshotFrames(snapshot, batch.target, graphFrames, pageUrl);
+        const observed = describeSnapshotFrames(snapshot, batch.process, graphFrames, pageUrl);
         batch.snapshotFrameIds = new Set(
           [...observed.ids].filter((id) => !unavailableFrameIds.has(id)),
         );
@@ -185,7 +534,7 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
         ];
         batch.documents = await prepareSnapshot(
           snapshot,
-          batch.target,
+          batch.process,
           batch.frames.filter((frame) => observed.ids.has(frame.frameId)),
           issues,
           signal,
@@ -203,6 +552,7 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
         for (const frame of batch.frames)
           if (!present.has(frame.frameId)) unavailable(batch, "dom", frame.frameId);
       } catch (error) {
+        forgetPendingAccessibility(tabId, axEnabled, error);
         throwCaptureAborted(signal);
         if (isolateChildTimeout(error, batch)) return;
         if (isCaptureAbort(error)) throw error;
@@ -211,18 +561,26 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
         batch.fallbackExcluded = await collectOverlayExcludedBackendIds(scoped, tabId, signal);
       }
       if (stopped.has(batch)) return;
-      if (!batch.frames.length && !graph)
+      if (!batch.frames.length && !graph?.frames.length) {
         batch.frames = [
           {
+            handle: toFrameDocumentHandle(tabId, { frameId: "root", loaderId: "" }),
             frameId: "root",
-            target: batch.target,
-            ...(!batch.target.sessionId && pageUrl ? { url: pageUrl } : {}),
+            loaderId: "",
+            processKey: batch.process.processKey,
+            isOutOfProcess: batch.process.isOutOfProcess,
+            ...(!batch.process.isOutOfProcess && pageUrl ? { url: pageUrl } : {}),
           },
         ];
+      }
       try {
         throwCaptureAborted(signal);
-        await scoped.send(tabId, "Accessibility.enable", {});
+        const currentAttachmentId = cdp.getAttachmentId(tabId);
+        if (!options.accessibilityLease?.hasActive(batch.process, currentAttachmentId)) {
+          await scoped.send(tabId, "Accessibility.enable", {});
+        }
       } catch (error) {
+        forgetPendingAccessibility(tabId, axEnabled, error);
         throwCaptureAborted(signal);
         if (isolateChildTimeout(error, batch)) return;
         if (isCaptureAbort(error)) throw error;
@@ -230,16 +588,16 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
         unavailable(batch, "ax");
         return;
       }
-      axReady.add(batch);
+      axEnabled.set(batch.process, cdp.getAttachmentId(tabId));
     },
     signal,
   );
 
   // Schedule AX by frame across all ready targets, rather than nesting pools.
   // Keep result slots in source order even when CDP replies arrive out of order.
-  const axTasks: { batch: TargetBatch<T>; frame: CdpFrame; result?: FrameAxBatch<T> }[] =
+  const axTasks: { batch: TargetBatch<T>; frame: FrameDocumentInfo; result?: FrameAxBatch<T> }[] =
     batches.flatMap((batch) =>
-      axReady.has(batch) ? batch.frames.map((frame) => ({ batch, frame })) : [],
+      axEnabled.has(batch.process) ? batch.frames.map((frame) => ({ batch, frame })) : [],
     );
   await collectTasks(
     axTasks,
@@ -248,14 +606,17 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
       if (stopped.has(batch)) return;
       try {
         throwCaptureAborted(signal);
-        const result = await cdpRunnerForTarget(cdp, batch.target).send<{ nodes?: T[] }>(
-          tabId,
+        const result = await cdp.sendToFrame<{ nodes?: T[] }>(
+          batch.process.rootHandle,
           "Accessibility.getFullAXTree",
           frame.frameId === "root" ? {} : { frameId: frame.frameId },
+          { ignoreFrameNavigation: true, signal },
         );
         throwCaptureAborted(signal);
         task.result = { frame, nodes: result.nodes ?? [] };
       } catch (error) {
+        forgetPendingAccessibility(tabId, axEnabled, error);
+        // Chrome may still be running this read; queue no cleanup behind it.
         throwCaptureAborted(signal);
         if (isolateChildTimeout(error, batch)) return;
         if (isCaptureAbort(error)) throw error;
@@ -272,11 +633,11 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   const claims = new Map<string, string>();
   const invalid = new Set(unavailableFrameIds);
   for (const batch of batches) {
-    const targetKey = cdpTargetKey(batch.target);
+    const processIdentity = frameProcessIdentityKey(batch.process);
     for (const id of batch.snapshotFrameIds ?? []) {
       const previous = claims.get(id);
-      if (previous !== undefined && previous !== targetKey) invalid.add(id);
-      claims.set(id, targetKey);
+      if (previous !== undefined && previous !== processIdentity) invalid.add(id);
+      claims.set(id, processIdentity);
     }
     const accepted = new Set(batch.frames.map((frame) => frame.frameId));
     for (const id of batch.snapshotFrameIds ?? []) if (!accepted.has(id)) invalid.add(id);
@@ -284,23 +645,28 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   const currentFrames = batches.flatMap((batch) =>
     batch.frames.filter(
       (frame) =>
-        !claims.has(frame.frameId) || claims.get(frame.frameId) === cdpTargetKey(batch.target),
+        !claims.has(frame.frameId) ||
+        claims.get(frame.frameId) === frameProcessIdentityKey(batch.process),
     ),
   );
-  const rootBatch = batches.find((batch) => !batch.target.sessionId);
+  const rootBatch = batches.find((batch) => !batch.process.isOutOfProcess);
   const rootFrameId =
-    rootBatch?.rootFrameId ?? graph?.rootFrameId ?? rootBatch?.frames[0]?.frameId ?? "root";
+    rootBatch?.rootFrameId || graph?.rootFrameId || rootBatch?.frames[0]?.frameId || "root";
   const ownershipInvalid = new Set(invalid);
   const identities = new Map<string, DocumentIdentity>();
   const selected = new Map(currentFrames.map((frame) => [frame.frameId, frame]));
   const checks = batches.flatMap((batch) => {
     const docs = new Map(batch.documents.map((doc) => [doc.frame.frameId, doc]));
     return batch.frames
-      .filter(
-        (frame) =>
+      .filter((frame) => {
+        const chosen = selected.get(frame.frameId);
+        return (
           !invalid.has(frame.frameId) &&
-          cdpTargetKey(selected.get(frame.frameId)!.target) === cdpTargetKey(batch.target),
-      )
+          chosen !== undefined &&
+          frameProcessIdentityKey({ tabId: chosen.handle.tabId, processKey: chosen.processKey }) ===
+            frameProcessIdentityKey(batch.process)
+        );
+      })
       .map((frame) => ({ batch, frame, doc: docs.get(frame.frameId) }));
   });
   const checkIdentities = (recheck = false) =>
@@ -316,7 +682,8 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
           return;
         if (!batch.snapshotAttachmentId || doc?.documentElementBackendNodeId === undefined) {
           issues.push({
-            target: frame.target,
+            tabId: frame.handle.tabId,
+            processKey: frame.processKey,
             frameId: frame.frameId,
             stage: "identity",
             reason: "identity-unverified",
@@ -325,26 +692,35 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
         }
         const identity: DocumentIdentity = {
           attachmentId: batch.snapshotAttachmentId,
-          target: frame.target,
+          tabId: frame.handle.tabId,
           frameId: frame.frameId,
+          loaderId: frame.loaderId ?? "",
           documentElementBackendNodeId: doc.documentElementBackendNodeId,
         };
         let verified: Awaited<ReturnType<typeof verifyDocumentIdentity>>;
         try {
           verified = await verifyDocumentIdentity(cdp, identity, signal);
         } catch (error) {
+          forgetPendingAccessibility(tabId, axEnabled, error);
           throwCaptureAborted(signal);
           if (!isolateChildTimeout(error, batch)) throw error;
           for (const id of unavailableFrameIds) invalid.add(id);
           return;
         }
-        const status =
-          cdp.getAttachmentId?.(tabId) === identity.attachmentId ? verified : "changed";
-        if (status === "current") identities.set(frame.frameId, identity);
-        else {
+        const status = cdp.getAttachmentId(tabId) === identity.attachmentId ? verified : "changed";
+        if (status === "current") {
+          cdp.recordFrameDocumentElement(
+            tabId,
+            frame.frameId,
+            identity.loaderId,
+            identity.documentElementBackendNodeId,
+          );
+          identities.set(frame.frameId, identity);
+        } else {
           invalid.add(frame.frameId);
           issues.push({
-            target: frame.target,
+            tabId: frame.handle.tabId,
+            processKey: frame.processKey,
             frameId: frame.frameId,
             stage: "identity",
             reason: status === "changed" ? "document-changed" : "identity-unavailable",
@@ -358,9 +734,10 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   let layoutTimedOut = false;
   if (!invalid.has(rootFrameId)) {
     try {
-      const measured = cssViewport(await geometry.layoutMetrics({ tabId }));
+      const measured = cssViewport(await geometry.layoutMetrics(rootProcessBoundary(tabId)));
       viewport = { width: measured.width, height: measured.height };
     } catch (error) {
+      forgetPendingAccessibility(tabId, axEnabled, error);
       throwCaptureAborted(signal);
       if (error instanceof CdpReadTimeoutError) layoutTimedOut = true;
       else if (isCaptureAbort(error)) throw error;
@@ -371,7 +748,8 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
       for (const frame of currentFrames)
         if (!invalid.has(frame.frameId))
           issues.push({
-            target: frame.target,
+            tabId: frame.handle.tabId,
+            processKey: frame.processKey,
             frameId: frame.frameId,
             stage: "geometry",
             reason: "geometry-unavailable",
@@ -384,7 +762,7 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
           try {
             await projectSnapshot(
               batch.documents,
-              batch.target,
+              batch.process,
               batch.frames.filter((frame) => !invalid.has(frame.frameId)),
               geometry,
               issues,
@@ -393,6 +771,7 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
               profile,
             );
           } catch (error) {
+            forgetPendingAccessibility(tabId, axEnabled, error);
             throwCaptureAborted(signal);
             if (!isolateChildTimeout(error, batch)) throw error;
           }
@@ -408,10 +787,12 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   // Reattachment during optional layout work invalidates even an earlier
   // successful identity proof. This check requires no renderer command.
   for (const [frameId, identity] of identities) {
-    if (cdp.getAttachmentId?.(tabId) !== identity.attachmentId) {
+    if (cdp.getAttachmentId(tabId) !== identity.attachmentId) {
       invalid.add(frameId);
+      const selectedFrame = selected.get(frameId);
       issues.push({
-        target: identity.target,
+        tabId,
+        processKey: selectedFrame?.processKey ?? "root",
         frameId,
         stage: "identity",
         reason: "document-changed",
@@ -437,7 +818,8 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   for (const frame of currentFrames) {
     if (ownershipInvalid.has(frame.frameId))
       issues.push({
-        target: frame.target,
+        tabId: frame.handle.tabId,
+        processKey: frame.processKey,
         frameId: frame.frameId,
         stage: "ownership",
         reason: "frame-ownership-unresolved",
@@ -447,13 +829,17 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
     throw new Error(
       ownershipInvalid.has(rootFrameId)
         ? "observation root document ownership is ambiguous"
-        : "observation document identity changed or could not be verified; observe again",
+        : OBSERVE_IDENTITY_CHANGED,
     );
   const frames = currentFrames.filter((frame) => !invalid.has(frame.frameId));
   const frameById = new Map(frames.map((frame) => [frame.frameId, frame]));
-  const belongs = (frame: CdpFrame) => {
+  const belongs = (frame: FrameDocumentInfo) => {
     const current = frameById.get(frame.frameId);
-    return current && cdpTargetKey(current.target) === cdpTargetKey(frame.target);
+    return (
+      current &&
+      frameProcessIdentityKey({ tabId: current.handle.tabId, processKey: current.processKey }) ===
+        frameProcessIdentityKey({ tabId: frame.handle.tabId, processKey: frame.processKey })
+    );
   };
   const decoded = new Map(
     batches
@@ -461,6 +847,7 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
       .filter((doc) => belongs(doc.frame))
       .map((doc) => [doc.frame.frameId, doc]),
   );
+  for (const doc of decoded.values()) finalizeDocumentHiddenExclusions(doc);
   const ax = batches.flatMap((batch) => batch.ax).filter((batch) => belongs(batch.frame));
   const documents = await buildFrameDocuments(
     { rootFrameId, frames },
@@ -476,7 +863,8 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
     signal,
     (frame) =>
       issues.push({
-        target: frame.target,
+        tabId: frame.handle.tabId,
+        processKey: frame.processKey,
         frameId: frame.frameId,
         stage: "ownership",
         reason: "frame-ownership-unresolved",
@@ -486,7 +874,9 @@ export async function captureObservationFacts<T extends FrameOwnedAxNode>(
   for (const document of documents) {
     const doc = decoded.get(document.frameId);
     const index = doc?.index ?? (await buildDocumentIndex([], signal));
-    const fallback = groups.get(cdpTargetKey(document.target))?.fallbackExcluded;
+    const fallback = groups.get(
+      frameProcessIdentityKey({ tabId: document.handle.tabId, processKey: document.processKey }),
+    )?.fallbackExcluded;
     const {
       domNodes,
       axNodes,

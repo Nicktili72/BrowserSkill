@@ -1,9 +1,15 @@
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toFrameDocumentHandle } from "@/browser-driver/frame-handles";
 import { InteractionPreferenceStore } from "@/lib/interaction-preferences";
 import { SessionManager } from "@/session-manager/manager";
 import { RefStore } from "@/session-manager/ref-store";
 import type { RequestHelpParams } from "@/transport/types";
 import { handleRequestHelp, type RequestHelpDeps, resetHelpLifecycleForTests } from "../human-loop";
+import { type CdpRunner, createStubCdpRunner } from "../shared";
 
 function chromeEvent<T extends (...args: never[]) => unknown>() {
   const listeners = new Set<T>();
@@ -31,6 +37,7 @@ function installHelpLifecycleChrome() {
     >();
   const tabsOnActivated = chromeEvent<(activeInfo: chrome.tabs.TabActiveInfo) => unknown>();
   const tabsOnCreated = chromeEvent<(tab: chrome.tabs.Tab) => unknown>();
+  const tabsOnRemoved = chromeEvent<(tabId: number) => unknown>();
   const tabsOnUpdated =
     chromeEvent<(tabId: number, changeInfo: chrome.tabs.TabChangeInfo) => unknown>();
   const webNavigationOnCompleted =
@@ -38,7 +45,12 @@ function installHelpLifecycleChrome() {
 
   vi.stubGlobal("chrome", {
     runtime: { onMessage: runtimeOnMessage },
-    tabs: { onActivated: tabsOnActivated, onCreated: tabsOnCreated, onUpdated: tabsOnUpdated },
+    tabs: {
+      onActivated: tabsOnActivated,
+      onCreated: tabsOnCreated,
+      onRemoved: tabsOnRemoved,
+      onUpdated: tabsOnUpdated,
+    },
     webNavigation: { onCompleted: webNavigationOnCompleted },
   });
 
@@ -46,6 +58,7 @@ function installHelpLifecycleChrome() {
     runtimeOnMessage,
     tabsOnActivated,
     tabsOnCreated,
+    tabsOnRemoved,
     tabsOnUpdated,
     webNavigationOnCompleted,
   };
@@ -150,6 +163,7 @@ describe("handleRequestHelp", () => {
     vi.spyOn(preferences, "get").mockReturnValue({
       confirmTabBorrow: true,
       requestHelpEnabled: false,
+      openAgentWindowMinimized: false,
     });
     const deps = baseDeps({ preferences });
     expect(await handleRequestHelp(fakeManager("abcd", 99, 5), baseParams(), deps)).toMatchObject({
@@ -170,6 +184,7 @@ describe("handleRequestHelp", () => {
     vi.spyOn(preferences, "get").mockImplementation(() => ({
       confirmTabBorrow: true,
       requestHelpEnabled: enabled,
+      openAgentWindowMinimized: false,
     }));
     let respond!: (value: unknown) => void;
     const deps = baseDeps({
@@ -211,6 +226,7 @@ describe("handleRequestHelp", () => {
     vi.spyOn(preferences, "get").mockImplementation(() => ({
       confirmTabBorrow: true,
       requestHelpEnabled: enabled,
+      openAgentWindowMinimized: false,
     }));
     vi.spyOn(preferences, "subscribe").mockImplementation((listener) => {
       changed = () => listener(preferences.get());
@@ -254,6 +270,7 @@ describe("handleRequestHelp", () => {
     vi.spyOn(preferences, "get").mockImplementation(() => ({
       confirmTabBorrow: true,
       requestHelpEnabled: enabled,
+      openAgentWindowMinimized: false,
     }));
     vi.spyOn(preferences, "subscribe").mockImplementation((listener) => {
       changed = () => listener(preferences.get());
@@ -544,10 +561,338 @@ describe("handleRequestHelp", () => {
     expect(res).toMatchObject({ outcome: "completed", completed_by: "system", tab_id: 5 });
   });
 
+  it.skipIf(process.env.BSK_URL_REGEX_CHILD === "1")(
+    "bounds dangerous URL regex checks in a child process",
+    () => {
+      const require = createRequire(import.meta.url);
+      const vitestCli = join(dirname(require.resolve("vitest/package.json")), "vitest.mjs");
+      const child = spawnSync(
+        process.execPath,
+        [
+          vitestCli,
+          "run",
+          fileURLToPath(import.meta.url),
+          "-t",
+          "isolated dangerous URL regex checks",
+        ],
+        {
+          cwd: process.cwd(),
+          env: { ...process.env, BSK_URL_REGEX_CHILD: "1" },
+          encoding: "utf8",
+          timeout: 10_000,
+        },
+      );
+      expect(child.error, `${child.stdout}\n${child.stderr}`).toBeUndefined();
+      expect(child.status, `${child.stdout}\n${child.stderr}`).toBe(0);
+    },
+  );
+
+  it.skipIf(process.env.BSK_URL_REGEX_CHILD !== "1")(
+    "isolated dangerous URL regex checks",
+    async () => {
+      const url = `https://app.example/${"a".repeat(28)}!`;
+      const deps = baseDeps({
+        sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+        tabsApi: {
+          get: vi.fn(async () => ({ id: 5, windowId: 99, active: true, url })) as never,
+          query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+        },
+      });
+      const started = performance.now();
+      const res = await handleRequestHelp(
+        fakeManager("abcd", 99, 5),
+        baseParams({
+          completion_criteria: {
+            any: [{ url_matches: "(a+)+$" }, { url_matches: "^https://app.example/a+!$" }],
+            stable_for_ms: 0,
+          },
+        }),
+        deps,
+      );
+      expect(res).toMatchObject({ outcome: "completed", completed_by: "system" });
+      expect(performance.now() - started).toBeLessThan(1_000);
+
+      const expanded = handleRequestHelp(
+        fakeManager("abcd", 99, 5),
+        baseParams({
+          completion_criteria: { any: [{ url_matches: `(?:${"[ab]".repeat(20)}){1000}$` }] },
+        }),
+        deps,
+      );
+      await expect(expanded).resolves.toMatchObject({ code: "invalid_params" });
+
+      const nearLimit = handleRequestHelp(
+        fakeManager("abcd", 99, 5),
+        baseParams({
+          completion_criteria: { any: [{ url_matches: `(?:${"a".repeat(118)}){1000}` }] },
+        }),
+        deps,
+      );
+      await expect(nearLimit).resolves.toMatchObject({ code: "invalid_params" });
+    },
+  );
+
+  it.each([
+    { label: "unsupported lookahead", pattern: "(?=a)" },
+    { label: "unsupported lookbehind", pattern: "(?<=a)b" },
+    { label: "unsupported Unicode escape", pattern: "\\u0061" },
+    { label: "unsupported large repetition", pattern: "a{1001}" },
+    { label: "unsupported empty negated class", pattern: "[^]" },
+    { label: "unsupported backreference", pattern: "(a)\\1" },
+    { label: "oversized pattern", pattern: "a".repeat(129) },
+  ])("rejects $label before starting help", async ({ pattern }) => {
+    const deps = baseDeps();
+    const res = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({ completion_criteria: { any: [{ url_matches: pattern }] } }),
+      deps,
+    );
+    expect(res).toMatchObject({ code: "invalid_params" });
+    expect(deps.activateTab).not.toHaveBeenCalled();
+    expect(deps.sendToTab).not.toHaveBeenCalled();
+  });
+
+  it("rejects too many conditions before starting help", async () => {
+    const deps = baseDeps();
+    const res = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({
+        completion_criteria: {
+          all: Array.from({ length: 5 }, () => ({ url_contains: "/done" })),
+          any: Array.from({ length: 4 }, () => ({ selector_exists: "#done" })),
+        },
+      }),
+      deps,
+    );
+    expect(res).toMatchObject({ code: "invalid_params" });
+    expect(deps.tabsApi.get).not.toHaveBeenCalled();
+    expect(deps.sendToTab).not.toHaveBeenCalled();
+  });
+
+  it("rejects patterns whose total compiled program is too large", async () => {
+    const deps = baseDeps();
+    const res = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({
+        completion_criteria: {
+          all: ["[ab]", "[ac]", "[ad]"].map((part) => ({
+            url_matches: `(?:${part.repeat(3)}){1000}`,
+          })),
+        },
+      }),
+      deps,
+    );
+    expect(res).toMatchObject({ code: "invalid_params" });
+    expect(deps.activateTab).not.toHaveBeenCalled();
+  });
+
+  it("charges repeated URL patterns once per condition", async () => {
+    const deps = baseDeps();
+    const pattern = "a.{1000}.{1000}.{1000}.{996}[#%]";
+    const single = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({ completion_criteria: { all: [{ url_matches: pattern }] } }),
+      deps,
+    );
+    expect(single).toMatchObject({ outcome: "continued" });
+
+    const res = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({
+        completion_criteria: {
+          all: Array.from({ length: 8 }, () => ({ url_matches: pattern })),
+        },
+      }),
+      deps,
+    );
+    expect(res).toMatchObject({ code: "invalid_params" });
+    expect(deps.activateTab).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { label: "null", urlMatches: null },
+    { label: "empty", urlMatches: "" },
+    { label: "omitted", urlMatches: undefined },
+  ])("treats $label URL regex as absent", async ({ urlMatches }) => {
+    const deps = baseDeps({
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+      tabsApi: {
+        get: vi.fn(async () => ({
+          id: 5,
+          windowId: 99,
+          active: true,
+          url: "https://app.example/done",
+        })) as never,
+        query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+      },
+    });
+    const res = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({
+        completion_criteria: {
+          any: [{ url_matches: urlMatches as string | undefined, url_contains: "/done" }],
+          stable_for_ms: 0,
+        },
+      }),
+      deps,
+    );
+    expect(res).toMatchObject({ outcome: "completed" });
+  });
+
+  it.each([
+    { label: "unanchored substring", pattern: "/done" },
+    { label: "start and end anchors", pattern: "^https://app\\.example/done$" },
+  ])("matches a normal URL with $label", async ({ pattern }) => {
+    const deps = baseDeps({
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+      tabsApi: {
+        get: vi.fn(async () => ({
+          id: 5,
+          windowId: 99,
+          active: true,
+          url: "https://app.example/done",
+        })) as never,
+        query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+      },
+    });
+    const res = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({ completion_criteria: { any: [{ url_matches: pattern }], stable_for_ms: 0 } }),
+      deps,
+    );
+    expect(res).toMatchObject({ outcome: "completed" });
+  });
+
+  it("does not match an anchored regex against a different URL", async () => {
+    const abort = new AbortController();
+    const tabsApi = {
+      get: vi.fn(async () => ({
+        id: 5,
+        windowId: 99,
+        active: true,
+        url: "https://app.example/done/next",
+      })) as never,
+      query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+    };
+    const deps = baseDeps({
+      signal: abort.signal,
+      tabsApi,
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+    });
+    const pending = handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({ completion_criteria: { any: [{ url_matches: "/done$" }], stable_for_ms: 0 } }),
+      deps,
+    );
+    await vi.waitFor(() => expect(tabsApi.get).toHaveBeenCalledTimes(2));
+    abort.abort();
+    await expect(pending).resolves.toMatchObject({ code: "cancelled" });
+  });
+
+  it.each([
+    { label: "url_contains", condition: { url_contains: "/done" } },
+    { label: "url_matches", condition: { url_matches: "/done" } },
+  ])("keeps waiting for manual control when a URL exceeds the $label limit", async ({
+    condition,
+  }) => {
+    const abort = new AbortController();
+    const tabsApi = {
+      get: vi.fn(async () => ({
+        id: 5,
+        windowId: 99,
+        active: true,
+        url: `https://app.example/done?${"x".repeat(8_192)}`,
+      })) as never,
+      query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+    };
+    const deps = baseDeps({
+      signal: abort.signal,
+      tabsApi,
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+    });
+    const pending = handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({ completion_criteria: { any: [condition], stable_for_ms: 0 } }),
+      deps,
+    );
+    await vi.waitFor(() => expect(tabsApi.get).toHaveBeenCalledTimes(2));
+    abort.abort();
+    await expect(pending).resolves.toMatchObject({ code: "cancelled" });
+  });
+
+  it("handles cancellation after later URL completion polls", async () => {
+    vi.useFakeTimers();
+    const abort = new AbortController();
+    const get = vi.fn(async () => ({
+      id: 5,
+      windowId: 99,
+      active: true,
+      url: "https://app.example/wait",
+    }));
+    const tabsApi = {
+      get: get as never,
+      query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+    };
+    const deps = baseDeps({
+      signal: abort.signal,
+      tabsApi,
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+    });
+    try {
+      const pending = handleRequestHelp(
+        fakeManager("abcd", 99, 5),
+        baseParams({ completion_criteria: { any: [{ url_matches: "/done$" }] } }),
+        deps,
+      );
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(get.mock.calls.length).toBeGreaterThanOrEqual(3);
+      abort.abort();
+      await expect(pending).resolves.toMatchObject({ code: "cancelled" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not overlap completion checks while an earlier check is pending", async () => {
+    vi.useFakeTimers();
+    const abort = new AbortController();
+    let releaseCheck!: (value: { result: { value: boolean } }) => void;
+    const evaluation = new Promise<{ result: { value: boolean } }>((resolve) => {
+      releaseCheck = resolve;
+    });
+    const send = vi.fn((_tabId: number, method: string) =>
+      method === "Runtime.evaluate" ? evaluation : Promise.resolve({}),
+    );
+    const deps = baseDeps({
+      signal: abort.signal,
+      cdp: { send } as unknown as RequestHelpDeps["cdp"],
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+    });
+    try {
+      const pending = handleRequestHelp(
+        fakeManager("abcd", 99, 5),
+        baseParams({ completion_criteria: { any: [{ selector_exists: "#done" }] } }),
+        deps,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(send.mock.calls.filter(([, method]) => method === "Runtime.evaluate")).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(send.mock.calls.filter(([, method]) => method === "Runtime.evaluate")).toHaveLength(1);
+      abort.abort();
+      releaseCheck({ result: { value: true } });
+      await expect(pending).resolves.toMatchObject({ code: "cancelled" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps user control active on new tabs without moving completion off the primary tab", async () => {
     vi.useFakeTimers();
     const chromeEvents = installHelpLifecycleChrome();
-    const sendToTab = vi.fn(async () => ({ type: "bsk-help-ack", ok: true }));
+    const sendToTab = vi.fn(async (_tabId: number, _msg: unknown) => ({
+      type: "bsk-help-ack",
+      ok: true,
+    }));
     const deps = baseDeps({
       autoAttachLifecycle: undefined,
       sendToTab,
@@ -685,7 +1030,7 @@ describe("handleRequestHelp", () => {
       findByWindowId: (wid: number) => (wid === 99 ? { sessionId: "abcd" } : null),
     } as unknown as SessionManager;
     const deps = baseDeps({
-      cdp: {
+      cdp: createStubCdpRunner({
         send: vi.fn(async (_tabId, method) => {
           if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
           if (method === "DOM.scrollIntoViewIfNeeded") return {};
@@ -697,7 +1042,7 @@ describe("handleRequestHelp", () => {
           }
           throw new Error(`unexpected ${method}`);
         }),
-      } as unknown as RequestHelpDeps["cdp"],
+      }),
     });
     const res = await handleRequestHelp(
       mgr,
@@ -732,7 +1077,12 @@ describe("handleRequestHelp", () => {
                   backendNodeId: 42,
                   tabId: 5,
                   frameId: "child",
-                  cdpSessionId: "child-session",
+                  handle: {
+                    tabId: 5,
+                    frameId: "child",
+                    loaderId: "child-loader",
+                    backendNodeId: 42,
+                  },
                   generation: 1,
                 }),
               },
@@ -752,34 +1102,48 @@ describe("handleRequestHelp", () => {
       }
       throw new Error(`unexpected root ${method}`);
     });
-    const sendToTarget = vi.fn(async (_target, method) => {
-      if (method === "DOM.scrollIntoViewIfNeeded") return {};
-      if (method === "DOM.getContentQuads") {
-        return { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] };
-      }
-      if (method === "Runtime.evaluate") return { result: { value: { width: 200, height: 100 } } };
-      if (method === "Page.getLayoutMetrics") {
-        return { cssLayoutViewport: { clientWidth: 200, clientHeight: 100 } };
-      }
-      throw new Error(`unexpected child ${method}`);
-    });
+    const sendToFrame = vi.fn(
+      async (handle: { tabId: number; frameId: string }, method: string) => {
+        if (handle.frameId !== "child") return send(handle.tabId, method);
+        if (method === "DOM.scrollIntoViewIfNeeded") return {};
+        if (method === "DOM.getContentQuads") {
+          return { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] };
+        }
+        if (method === "Runtime.evaluate")
+          return { result: { value: { width: 200, height: 100 } } };
+        if (method === "Page.getLayoutMetrics") {
+          return { cssLayoutViewport: { clientWidth: 200, clientHeight: 100 } };
+        }
+        throw new Error(`unexpected child ${method}`);
+      },
+    );
+    const childHandle = toFrameDocumentHandle(5, { frameId: "child", loaderId: "child-loader" });
     const deps = baseDeps({
-      cdp: {
+      cdp: createStubCdpRunner({
         send,
-        sendToTarget,
-        getFrameGraph: vi.fn(async () => ({
+        sendToFrame: sendToFrame as CdpRunner["sendToFrame"],
+        getFrameDocuments: vi.fn(async () => ({
           rootFrameId: "main",
           frames: [
-            { frameId: "main", target: { tabId: 5 } },
             {
+              handle: toFrameDocumentHandle(5, { frameId: "main", loaderId: "main-loader" }),
+              frameId: "main",
+              loaderId: "main-loader",
+              processKey: "root",
+              isOutOfProcess: false,
+            },
+            {
+              handle: childHandle,
               frameId: "child",
+              loaderId: "child-loader",
               parentFrameId: "main",
               ownerBackendNodeId: 99,
-              target: { tabId: 5, sessionId: "child-session" },
+              processKey: "oopif:child",
+              isOutOfProcess: true,
             },
           ],
         })),
-      } as unknown as NonNullable<RequestHelpDeps["cdp"]>,
+      }),
     });
 
     const res = await handleRequestHelp(
@@ -791,10 +1155,12 @@ describe("handleRequestHelp", () => {
     const sentMsg = (deps.sendToTab as ReturnType<typeof vi.fn>).mock.calls[0][1];
     expect(sentMsg.rects).toEqual([{ top: 346, left: 224, width: 200, height: 80 }]);
     expect(res).toMatchObject({ resolved_targets: [{ matched: true, ref: "@e1" }] });
-    expect(sendToTarget).toHaveBeenCalledWith(
-      { tabId: 5, sessionId: "child-session" },
+    expect(sendToFrame).toHaveBeenCalledWith(
+      expect.objectContaining(childHandle),
       "DOM.getContentQuads",
-      { backendNodeId: 42 },
+      {
+        backendNodeId: 42,
+      },
     );
   });
 
@@ -937,5 +1303,291 @@ describe("handleRequestHelp", () => {
     ac.abort();
     const res = await p;
     expect("code" in res ? res.code : (res as { outcome: string }).outcome).toMatch(/cancelled/);
+  });
+
+  it("cancels promptly, clears sibling compact banners, and detaches global listeners when primaryTabId closes", async () => {
+    vi.useFakeTimers();
+    const chromeEvents = installHelpLifecycleChrome();
+    const sendToTab = vi.fn(async (_tabId: number, _msg: unknown) => ({
+      type: "bsk-help-ack",
+      ok: true,
+    }));
+    const notifications = {
+      create: vi.fn(async () => "notif-1"),
+      clear: vi.fn(async () => true),
+    };
+    const deps = baseDeps({
+      autoAttachLifecycle: undefined,
+      sendToTab,
+      notifications,
+      tabsApi: {
+        get: vi.fn(async (tabId: number) => ({
+          id: tabId,
+          windowId: 99,
+          active: tabId === 6,
+          url: "https://app.example/login",
+        })) as never,
+        query: vi.fn(async () => [{ id: 5, windowId: 99, active: true }] as never),
+      },
+    });
+
+    try {
+      const pending = handleRequestHelp(
+        fakeManager("abcd", 99, 5),
+        baseParams({
+          tab_id: 5,
+          timeout_ms: 300_000,
+          completion_criteria: { any: [{ url_contains: "/done" }] },
+        }),
+        deps,
+      );
+      await vi.waitFor(() => expect(sendToTab).toHaveBeenCalledWith(5, expect.anything()));
+
+      // User opens/switches to sibling tab 6 in the same Agent Window -> receives compact banner.
+      chromeEvents.tabsOnActivated.emit({ tabId: 6, windowId: 99 });
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() =>
+        expect(sendToTab).toHaveBeenCalledWith(
+          6,
+          expect.objectContaining({ type: "bsk-help-request", displayMode: "compact" }),
+        ),
+      );
+
+      // Closing the primary tab resolves immediately instead of hanging 5 minutes.
+      sendToTab.mockClear();
+      chromeEvents.tabsOnRemoved.emit(5);
+      await expect(pending).resolves.toMatchObject({
+        code: "cancelled",
+        message: expect.stringContaining("primary tab was closed"),
+      });
+
+      // Sibling tab compact banner is torn down, closed tab 5 is skipped, and notification cleared.
+      expect(sendToTab).toHaveBeenCalledWith(
+        6,
+        expect.objectContaining({ type: "bsk-help-cancel" }),
+      );
+      expect(sendToTab).not.toHaveBeenCalledWith(5, expect.anything());
+      expect(notifications.clear).toHaveBeenCalled();
+
+      // All global lifecycle listeners are detached once no help requests remain active.
+      expect(chromeEvents.runtimeOnMessage.removeListener).toHaveBeenCalledOnce();
+      expect(chromeEvents.tabsOnCreated.removeListener).toHaveBeenCalledTimes(
+        chromeEvents.tabsOnCreated.addListener.mock.calls.length,
+      );
+      expect(chromeEvents.tabsOnActivated.removeListener).toHaveBeenCalledTimes(
+        chromeEvents.tabsOnActivated.addListener.mock.calls.length,
+      );
+      expect(chromeEvents.tabsOnRemoved.removeListener).toHaveBeenCalledTimes(
+        chromeEvents.tabsOnRemoved.addListener.mock.calls.length,
+      );
+      expect(chromeEvents.webNavigationOnCompleted.removeListener).toHaveBeenCalledTimes(
+        chromeEvents.webNavigationOnCompleted.addListener.mock.calls.length,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not force-scroll the target element again when switching tabs back to the primary tab", async () => {
+    vi.useFakeTimers();
+    const chromeEvents = installHelpLifecycleChrome();
+    const refStore = new RefStore();
+    refStore.set("e1", 42, { tabId: 5 });
+    const mgr = {
+      get: (id: string) =>
+        id === "abcd"
+          ? {
+              sessionId: "abcd",
+              agentWindowId: 99,
+              refStore,
+              borrowedTabs: new Map(),
+            }
+          : null,
+      findByWindowId: (wid: number) => (wid === 99 ? { sessionId: "abcd" } : null),
+    } as unknown as SessionManager;
+    const cdpSend = vi.fn(async (_tabId: number, method: string) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.scrollIntoViewIfNeeded") return {};
+      if (method === "DOM.getContentQuads") {
+        return { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] };
+      }
+      if (method === "Page.getLayoutMetrics") {
+        return { cssLayoutViewport: { clientWidth: 1280, clientHeight: 720 } };
+      }
+      return {};
+    });
+    const ac = new AbortController();
+    const deps = baseDeps({
+      autoAttachLifecycle: undefined,
+      signal: ac.signal,
+      sendToTab: vi.fn(async () => ({ type: "bsk-help-ack", ok: true })),
+      cdp: createStubCdpRunner({ send: cdpSend }),
+    });
+
+    try {
+      const pending = handleRequestHelp(
+        mgr,
+        baseParams({ tab_id: 5, targets: [{ ref: "@e1" }], timeout_ms: 60_000 }),
+        deps,
+      );
+      await vi.waitFor(() =>
+        expect(deps.sendToTab).toHaveBeenCalledWith(
+          5,
+          expect.objectContaining({ type: "bsk-help-request" }),
+        ),
+      );
+      const scrollCallsInitially = cdpSend.mock.calls.filter(
+        ([, method]) => method === "DOM.scrollIntoViewIfNeeded",
+      ).length;
+      expect(scrollCallsInitially).toBe(1);
+
+      // User switches to another tab (e.g. to copy OTP) and returns to primary tab 5.
+      chromeEvents.tabsOnActivated.emit({ tabId: 5, windowId: 99 });
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() =>
+        expect(
+          (deps.sendToTab as ReturnType<typeof vi.fn>).mock.calls.length,
+        ).toBeGreaterThanOrEqual(2),
+      );
+
+      const scrollCallsAfterSwitch = cdpSend.mock.calls.filter(
+        ([, method]) => method === "DOM.scrollIntoViewIfNeeded",
+      ).length;
+      expect(scrollCallsAfterSwitch).toBe(1);
+
+      ac.abort();
+      await expect(pending).resolves.toMatchObject({ code: "cancelled" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels immediately when primaryTabId closes during setup before overlay registration", async () => {
+    const chromeEvents = installHelpLifecycleChrome();
+    let tabOpen = true;
+    const deps = baseDeps({
+      autoAttachLifecycle: undefined,
+      tabsApi: {
+        get: vi.fn(async (id: number) => {
+          if (!tabOpen) throw new Error(`No tab with id: ${id}`);
+          return { id, windowId: 99, active: true, url: "https://app.example/" } as never;
+        }),
+        query: vi.fn(async () =>
+          tabOpen ? ([{ id: 5, windowId: 99, active: true }] as never) : ([] as never),
+        ),
+      },
+      windows: {
+        update: vi.fn(async () => {
+          tabOpen = false;
+          chromeEvents.tabsOnRemoved.emit(5);
+          return {} as never;
+        }),
+      },
+      activateTab: vi.fn(async () => {
+        throw new Error("No tab with id: 5");
+      }),
+      sendToTab: vi.fn(async () => {
+        throw new Error("No tab with id: 5");
+      }),
+    });
+
+    const result = await handleRequestHelp(
+      fakeManager("abcd", 99, 5),
+      baseParams({ tab_id: 5, timeout_ms: 60_000 }),
+      deps,
+    );
+
+    expect(result).toEqual({
+      code: "cancelled",
+      message: "request_help primary tab was closed",
+    });
+    expect(chromeEvents.tabsOnRemoved.removeListener).toHaveBeenCalled();
+  });
+
+  it("sets hasDynamicRects: true when an iframe ref target is offscreen on tab switch back", async () => {
+    vi.useFakeTimers();
+    const chromeEvents = installHelpLifecycleChrome();
+    const refStore = new RefStore();
+    refStore.set("e1", 42, { tabId: 5 });
+    const mgr = {
+      get: (id: string) =>
+        id === "abcd"
+          ? {
+              sessionId: "abcd",
+              agentWindowId: 99,
+              refStore,
+              borrowedTabs: new Map(),
+            }
+          : null,
+      findByWindowId: (wid: number) => (wid === 99 ? { sessionId: "abcd" } : null),
+    } as unknown as SessionManager;
+    let quadCalls = 0;
+    const cdpSend = vi.fn(async (_tabId: number, method: string) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.scrollIntoViewIfNeeded") return {};
+      if (method === "DOM.getContentQuads") {
+        quadCalls += 1;
+        // First capture (initial): visible; second capture (after tab switch back): offscreen.
+        if (quadCalls === 1) return { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] };
+        return { quads: [[10, 2000, 110, 2000, 110, 2040, 10, 2040]] };
+      }
+      if (method === "Page.getLayoutMetrics") {
+        return { cssLayoutViewport: { clientWidth: 1280, clientHeight: 720 } };
+      }
+      return {};
+    });
+    const ac = new AbortController();
+    const sendToTab = vi.fn(async (_tabId: number, _msg: unknown) => ({
+      type: "bsk-help-ack",
+      ok: true,
+    }));
+    const deps = baseDeps({
+      autoAttachLifecycle: undefined,
+      signal: ac.signal,
+      sendToTab,
+      cdp: createStubCdpRunner({ send: cdpSend }),
+    });
+
+    try {
+      const pending = handleRequestHelp(
+        mgr,
+        baseParams({ tab_id: 5, targets: [{ ref: "@e1" }], timeout_ms: 60_000 }),
+        deps,
+      );
+      await vi.waitFor(() => expect(sendToTab).toHaveBeenCalledTimes(1));
+
+      // Switch back while target is scrolled offscreen -> rects may be empty, but hasDynamicRects stays true.
+      chromeEvents.tabsOnActivated.emit({ tabId: 5, windowId: 99 });
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() => expect(sendToTab).toHaveBeenCalledTimes(2));
+
+      const rearmMsg = sendToTab.mock.calls[1]?.[1] as {
+        hasDynamicRects?: boolean;
+        rects?: unknown[];
+      };
+      expect(rearmMsg.hasDynamicRects).toBe(true);
+
+      // HELP_QUERY on remount also includes hasDynamicRects: true matching helpRequestMessage.
+      const queryReply = vi.fn();
+      chromeEvents.runtimeOnMessage.emit(
+        { type: "bsk-help-query" },
+        { tab: { id: 5 } as chrome.tabs.Tab },
+        queryReply,
+      );
+      await vi.waitFor(() => expect(queryReply).toHaveBeenCalledTimes(1));
+      expect(queryReply).toHaveBeenCalledWith(
+        expect.objectContaining({
+          active: true,
+          request: expect.objectContaining({
+            hasDynamicRects: true,
+          }),
+        }),
+      );
+
+      ac.abort();
+      await expect(pending).resolves.toMatchObject({ code: "cancelled" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

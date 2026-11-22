@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "ControlPolicy": {
+      "oneOf": [
+        {
+          "enum": [
+            "strict",
+            "target"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "Keep the negotiated policy, or choose target when the session is unconfigured.",
+          "type": "string"
+        }
+      ]
+    },
+    "CooperateAction": {
+      "enum": [
+        "enable",
+        "status",
+        "sync",
+        "wait"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "action": {
+      "$ref": "#/definitions/CooperateAction"
+    },
+    "control_policy": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ControlPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A negotiated policy remains fixed for the session."
+    },
+    "max_tokens": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "tab_id": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "timeout_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "session_id",
+    "action"
+  ],
+  "title": "CooperateParams",
+  "type": "object"
+}

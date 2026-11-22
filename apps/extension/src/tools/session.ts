@@ -1,3 +1,4 @@
+import { isControllerInfo } from "@/lib/controller-info";
 import {
   DEFAULT_INTERACTION_PREFERENCES,
   type InteractionPreferenceStore,
@@ -5,12 +6,24 @@ import {
 } from "@/lib/interaction-preferences";
 import { withTaskPreviewStop } from "@/lib/task-preview";
 import { type SessionManager, SessionStartCleanupError } from "@/session-manager/manager";
-import type { InteractionPolicy, RpcError } from "@/transport/types";
+import { detectBrowserMeta } from "@/transport/handshake";
+import type {
+  SessionStartParams as ProtocolSessionStartParams,
+  RpcError,
+  SessionStartResult,
+  SessionStopParams,
+  SessionStopResult,
+} from "@/transport/types";
+import type { DialogCleanupCdp } from "./dialogs";
 import { rpcError } from "./errors";
-import { clearRecordingForSession } from "./record";
+import { clearHelpForSession } from "./human-loop";
+import { clearObserveIdentityStreaksForSession } from "./observation";
+import { clearRecordingForSession, type RecordDeps } from "./record";
 import type { CdpRunner, ChromeTabsApi } from "./shared";
-import { isRpcError } from "./shared";
+import { evictSessionCdpRunner, isRpcError } from "./shared";
 import { chromeAgentOverlayResetApi, returnBorrowedTab, type TabManagementDeps } from "./tabs";
+
+export type { SessionStartResult, SessionStopParams, SessionStopResult } from "@/transport/types";
 
 /** Valid range for Agent Window dimensions in CSS pixels. */
 export const WINDOW_SIZE_MIN = 100;
@@ -50,23 +63,10 @@ export function validateWindowSize(
   }
   return { width: width as number, height: height as number };
 }
-
-export interface SessionStartParams {
-  session_id: string;
-  browser_instance_id?: string;
-  /** Optional Agent Window outer width in CSS pixels (100..=7680). */
-  width?: number;
-  /** Optional Agent Window outer height in CSS pixels (100..=7680). */
-  height?: number;
-  /** Defaults to true so existing clients preserve visible Agent Windows. */
-  focused?: boolean;
-  /** Legacy input accepted for compatibility; browser settings always decide. */
+/** Legacy input remains accepted at the handler boundary. */
+export interface SessionStartParams extends Omit<ProtocolSessionStartParams, "controller"> {
+  controller?: { name: string; project?: string | null; color?: string | null } | null;
   unattended?: boolean;
-}
-
-export interface SessionStartResult {
-  interaction?: InteractionPolicy;
-  agent_window_id?: number;
 }
 
 export interface SessionStartDeps {
@@ -74,29 +74,12 @@ export interface SessionStartDeps {
   signal?: AbortSignal;
 }
 
-export interface SessionStopParams {
-  session_id: string;
-}
-
-export interface SessionStopResult {
-  /** Tab ids that were returned to their original (or fallback) window. */
-  returned_tab_ids?: number[];
-  /** Tab ids whose return path failed; those entries remain borrowed so
-   *  shutdown can be retried without closing the Agent Window. */
-  return_failures?: Array<{ tab_id: number; code: string; message: string }>;
-  /**
-   * True when the Agent Window was *released* to the user (instead of being
-   * closed) because it still contained user-created tabs after the agent's own
-   * tabs were closed. Single-session scope.
-   */
-  window_released?: boolean;
-}
-
 export interface SessionStopDeps {
   signal?: AbortSignal;
-  cdp?: Pick<CdpRunner, "releaseSessionTab"> & {
-    detachSession(sessionId: string): Promise<void>;
-  };
+  cdp?: Partial<Pick<CdpRunner, "releaseSessionTab">> &
+    DialogCleanupCdp & {
+      detachSession(sessionId: string): Promise<void>;
+    };
   /**
    * Tab management deps forwarded to `returnBorrowedTab`. Defaults to
    * the production `chrome.tabs` / `chrome.windows` wrappers, but
@@ -111,6 +94,8 @@ export interface SessionStopDeps {
    * pure. Tests can inject a fake `ChromeTabsApi` too.
    */
   tabsQuery?: ChromeTabsApi;
+  /** Optional recording runtime deps forwarded to `clearRecordingForSession`. */
+  recording?: Partial<RecordDeps>;
 }
 
 /**
@@ -132,18 +117,33 @@ export async function handleSessionStart(
   if (params.unattended !== undefined && typeof params.unattended !== "boolean") {
     return { code: "invalid_params", message: "unattended must be a boolean" };
   }
+  if (params.incognito !== undefined && typeof params.incognito !== "boolean") {
+    return { code: "invalid_params", message: "incognito must be a boolean" };
+  }
   const sizeOrErr = validateWindowSize(params.width, params.height);
   if (isRpcError(sizeOrErr)) return sizeOrErr;
+  if (params.controller != null && !isControllerInfo(params.controller)) {
+    return {
+      code: "invalid_params",
+      message:
+        "controller requires a name (1..=80 characters), optional project (1..=120), no control characters, and optional #RRGGBB color",
+    };
+  }
   try {
     await deps.preferences?.readyOrFallback();
+    const prefs = deps.preferences?.get() ?? DEFAULT_INTERACTION_PREFERENCES;
+    const minimized = !params.focused && prefs.openAgentWindowMinimized;
     const ctx = await manager.start(params.session_id, {
+      controller: params.controller ?? undefined,
+      incognito: params.incognito,
       size: sizeOrErr,
       focused: params.focused,
+      ...(minimized ? { minimized: true } : {}),
       signal: deps.signal,
     });
     return {
       agent_window_id: ctx.agentWindowId,
-      interaction: interactionPolicy(deps.preferences?.get() ?? DEFAULT_INTERACTION_PREFERENCES),
+      interaction: interactionPolicy(prefs),
     };
   } catch (err) {
     if (err instanceof SessionStartCleanupError) {
@@ -183,10 +183,10 @@ export async function handleSessionStart(
  *      cleanly (review parity with M6).
  *   3. Detach CDP sessions the extension still holds for this
  *      session (no-op if M6/M7 didn't attach to any tab).
- *   4. Close the agent-created tabs and the home tab (design §3.2).
- *   5. If any tab remains — those are user-created tabs — release the
- *      window to the user (dropOnly) instead of closing it, so user
- *      tabs survive. Otherwise close the window as before.
+ *   4. Close the agent-created tabs and the home tab (design §3.2),
+ *      retaining the final tab on Yandex for window cleanup.
+ *   5. Release the window to the user (dropOnly) if user-created tabs
+ *      remain. Otherwise close the window and any remaining agent tabs.
  *
  * Failures in step 1 keep the Agent Window open: a failed borrowed tab
  * may still be there, so closing the window would risk losing user
@@ -224,22 +224,39 @@ async function stopSession(
   }
 
   // Remote access must end before returning a tab. Preserve the local recording
-  // when a failed return keeps its session alive for a retry.
-  if (ctx.remote) clearRecordingForSession(params.session_id);
+  // and help request when a failed return keeps its session alive for a retry.
+  if (ctx.remote) {
+    if (deps.recording) clearRecordingForSession(params.session_id, deps.recording);
+    else clearRecordingForSession(params.session_id);
+    clearHelpForSession(params.session_id);
+    clearObserveIdentityStreaksForSession(params.session_id);
+  }
 
-  // Step 1: auto-return borrowed tabs. Iterate over a snapshot of the
-  // ids so deletions during iteration do not break the Map iterator.
+  // Step 1: auto-return borrowed tabs. Dynamically pull unattempted keys so tabs
+  // replaced mid-stop via `chrome.tabs.onReplaced` are still returned instead of stranded.
   const returnedTabIds: number[] = [];
   const returnFailures: SessionStopResult["return_failures"] = [];
-  const borrowedIds = Array.from(ctx.borrowedTabs.keys());
-  for (const tabId of borrowedIds) {
+  const attempted = new Set<number>();
+  while (true) {
+    if (manager.get(ctx.sessionId) !== ctx) return {};
+    let tabId: number | undefined;
+    for (const candidate of ctx.borrowedTabs.keys()) {
+      if (!attempted.has(candidate)) {
+        tabId = candidate;
+        break;
+      }
+    }
+    if (tabId === undefined) break;
+    attempted.add(tabId);
     // A close event may have removed this borrow while another tab returned.
     if (!ctx.borrowedTabs.has(tabId)) continue;
     try {
       const tabManagement = {
         ...(deps.tabManagement ?? {}),
+        tabsQuery: deps.tabsQuery ?? deps.tabManagement?.tabsQuery,
         cdp: deps.cdp ?? deps.tabManagement?.cdp,
         signal: deps.signal,
+        isSessionLive: () => manager.get(ctx.sessionId) === ctx,
         isAgentWindowId:
           deps.tabManagement?.isAgentWindowId ??
           ((windowId: number) => manager.findByWindowId(windowId) !== null),
@@ -301,7 +318,12 @@ async function stopSession(
   // Step 2: clear the per-session RefStore (review M6/M7 parity).
   ctx.refStore.clear();
 
-  if (!ctx.remote) clearRecordingForSession(params.session_id);
+  if (!ctx.remote) {
+    if (deps.recording) clearRecordingForSession(params.session_id, deps.recording);
+    else clearRecordingForSession(params.session_id);
+    clearHelpForSession(params.session_id);
+    clearObserveIdentityStreaksForSession(params.session_id);
+  }
 
   // Step 3: detach CDP sessions this session opened (no-op if none).
   await deps.cdp?.detachSession(params.session_id);
@@ -311,6 +333,12 @@ async function stopSession(
   }
 
   return manager.withExpectedWindowClose(ctx, async () => {
+    const interrupted = (): SessionStopResult | RpcError | undefined => {
+      if (deps.signal?.aborted) return { code: "cancelled", message: "session_stop aborted" };
+      // Another lifecycle event may have already released every page. A normal
+      // last-tab close also removes the session; both paths need no more work.
+      if (manager.get(ctx.sessionId) !== ctx) return result;
+    };
     // Step 4: close every tab explicitly created by the agent, including the
     // home tab. `tabsApi` is a
     // TabMutationApi (remove only); `queryApi` is a separate read-only
@@ -318,12 +346,29 @@ async function stopSession(
     // closing the window (see Step 5).
     const tabsApi = deps.tabManagement?.tabs;
     const queryApi = deps.tabsQuery;
+    // Yandex 26.8 cancels subsequent debugger attachments when tabs.remove
+    // closes the last tab of a window (issue #272). Closing the window
+    // through windows.remove does not trigger that browser bug. Keep
+    // the last owned tab for Step 5, which still checks for user-created tabs.
+    const closeLastTabWithWindow = detectBrowserMeta().name === "yandex";
+    const deferredAgentTabs = new Set<number>();
 
     if (tabsApi) {
       // Close each agent-created tab that still exists.
       const agentCreatedTabIds = Array.from(ctx.agentCreatedTabs);
       for (const tabId of agentCreatedTabIds) {
+        const ended = interrupted();
+        if (ended) return ended;
         try {
+          if (closeLastTabWithWindow && queryApi) {
+            const liveTabs = await queryApi.query({ windowId: ctx.agentWindowId });
+            const ended = interrupted();
+            if (ended) return ended;
+            if (liveTabs.length === 1 && liveTabs[0]?.id === tabId) {
+              deferredAgentTabs.add(tabId);
+              continue;
+            }
+          }
           await tabsApi.remove(tabId);
           ctx.agentCreatedTabs.delete(tabId);
         } catch (err) {
@@ -333,11 +378,16 @@ async function stopSession(
       }
     }
 
+    const ended = interrupted();
+    if (ended) return ended;
+
     // Step 5: decide whether to release (keep) the window or close it.
     let shouldRelease = (ctx.observedTabs?.size ?? 0) > 0;
     if (queryApi) {
       try {
         const liveWindowTabs = await queryApi.query({ windowId: ctx.agentWindowId });
+        const ended = interrupted();
+        if (ended) return ended;
         // Only genuine *user* tabs count toward keeping the window open.
         // An agent tab that failed to close in Step 4 may still be present
         // here; if we counted it as a reason to release (dropOnly), the
@@ -347,9 +397,30 @@ async function stopSession(
           if (t.id === undefined) return false;
           return !ctx.agentCreatedTabs.has(t.id);
         });
-        const leakedAgentTabs = liveWindowTabs.filter(
-          (t) => t.id !== undefined && ctx.agentCreatedTabs.has(t.id),
+        let leakedAgentTabs = liveWindowTabs.filter(
+          (t): t is chrome.tabs.Tab & { id: number } =>
+            t.id !== undefined && ctx.agentCreatedTabs.has(t.id),
         );
+        if (
+          userTabs.length > 0 &&
+          leakedAgentTabs.length > 0 &&
+          tabsApi &&
+          leakedAgentTabs.every((tab) => deferredAgentTabs.has(tab.id))
+        ) {
+          // A user opened a tab after Step 4 deferred the final agent tab.
+          // It is now safe to remove that tab without closing the window.
+          for (const tab of leakedAgentTabs) {
+            const ended = interrupted();
+            if (ended) return ended;
+            try {
+              await tabsApi.remove(tab.id);
+              ctx.agentCreatedTabs.delete(tab.id);
+            } catch (err) {
+              console.warn(`[bsk session_stop] failed to close deferred agent tab ${tab.id}`, err);
+            }
+          }
+          leakedAgentTabs = leakedAgentTabs.filter((tab) => ctx.agentCreatedTabs.has(tab.id));
+        }
         if (leakedAgentTabs.length > 0 && userTabs.length > 0) {
           // Neither releasing ownership nor closing this mixed window is safe.
           // Keep the binding so a later stop can retry only the agent tabs.
@@ -363,10 +434,11 @@ async function stopSession(
             },
           );
         }
-        if (leakedAgentTabs.length > 0) {
+        const failedAgentTabs = leakedAgentTabs.filter((tab) => !deferredAgentTabs.has(tab.id));
+        if (failedAgentTabs.length > 0) {
           console.warn(
-            `[bsk session_stop] ${leakedAgentTabs.length} agent tab(s) failed to close; forcing window close instead of release`,
-            leakedAgentTabs.map((t) => t.id),
+            `[bsk session_stop] ${failedAgentTabs.length} agent tab(s) failed to close; forcing window close instead of release`,
+            failedAgentTabs.map((t) => t.id),
           );
         }
         shouldRelease = userTabs.length > 0;
@@ -376,10 +448,14 @@ async function stopSession(
       }
     }
 
+    const finished = interrupted();
+    if (finished) return finished;
+
     if (shouldRelease) {
       // Keep the window + its user tabs; only drop the session binding.
       const observedTabIds = Array.from(ctx.observedTabs ?? []);
       await manager.stop(params.session_id, { dropOnly: true });
+      evictSessionCdpRunner(deps.cdp, params.session_id);
       // Closing an agent tab may have reactivated an observed tab. Reset only
       // after dropping the session so subsequent overlay refreshes stay hidden.
       const overlayReset = deps.tabManagement?.agentOverlayReset ?? chromeAgentOverlayResetApi;
@@ -391,8 +467,9 @@ async function stopSession(
       }
       result.window_released = true;
     } else {
-      // Window is empty (or we couldn't verify state) — close it.
+      // Close the window and any remaining agent-owned tabs.
       await manager.stop(params.session_id);
+      evictSessionCdpRunner(deps.cdp, params.session_id);
     }
 
     return result;

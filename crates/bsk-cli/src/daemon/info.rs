@@ -27,6 +27,22 @@ pub struct DaemonInfo {
     /// `SystemTime` rendered as RFC 3339-ish seconds-since-epoch for
     /// portability across platforms.
     pub started_at_epoch_secs: u64,
+    /// Owned by a terminal or supervisor (`--foreground`, server mode) rather
+    /// than started by `bsk` in the background. Only its owner restarts it.
+    /// Omitted when false, so detached daemons write the same file as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_managed: bool,
+    /// Negotiated IPC protocol version written by >=0.5.0 Wave 3 daemons so
+    /// business commands can validate protocol support without opening a
+    /// separate `system.status` probe socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    /// True when the daemon supports out-of-band `IpcEnvelope` `meta` headers
+    /// over local IPC. Omitted (defaults to `false`) in `daemon.json` files
+    /// written by pre-envelope `"2.0"` daemons so optimistic CLI callers fall
+    /// back to legacy `_`-prefixed scope fields during rolling upgrades.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ipc_envelope: bool,
 }
 
 impl DaemonInfo {
@@ -40,7 +56,25 @@ impl DaemonInfo {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            host_managed: false,
+            protocol_version: None,
+            ipc_envelope: false,
         }
+    }
+
+    pub fn with_host_managed(mut self, host_managed: bool) -> Self {
+        self.host_managed = host_managed;
+        self
+    }
+
+    pub fn with_protocol_version(mut self, protocol_version: impl Into<String>) -> Self {
+        self.protocol_version = Some(protocol_version.into());
+        self
+    }
+
+    pub fn with_ipc_envelope(mut self, ipc_envelope: bool) -> Self {
+        self.ipc_envelope = ipc_envelope;
+        self
     }
 }
 
@@ -159,7 +193,7 @@ mod tests {
         let info = DaemonInfo::now(
             std::process::id(),
             tmp.path().join("daemon.sock"),
-            52800,
+            crate::daemon::DEFAULT_WS_PORT,
             "0.1.0-test",
         );
         write_to_path(&info, &path).unwrap();
@@ -192,5 +226,44 @@ mod tests {
         let parsed = read_from_path(&path).unwrap().unwrap();
         assert_eq!(parsed.pid, 2);
         assert_eq!(parsed.version, "b");
+    }
+
+    #[test]
+    fn only_host_managed_daemons_record_their_owner() {
+        let detached = DaemonInfo::now(1, "sock".into(), 1, "a");
+        let json = serde_json::to_value(&detached).unwrap();
+        assert!(json.get("host_managed").is_none(), "{json}");
+
+        let host_managed = detached.clone().with_host_managed(true);
+        let json = serde_json::to_value(&host_managed).unwrap();
+        assert_eq!(json["host_managed"], true);
+        assert_eq!(
+            serde_json::from_value::<DaemonInfo>(json).unwrap(),
+            host_managed
+        );
+
+        // Files written before the field existed describe detached daemons.
+        let mut older = serde_json::to_value(&detached).unwrap();
+        older.as_object_mut().unwrap().remove("host_managed");
+        let parsed_older = serde_json::from_value::<DaemonInfo>(older).unwrap();
+        assert!(!parsed_older.host_managed);
+        assert!(!parsed_older.ipc_envelope);
+
+        // `ipc_envelope` is omitted when false and preserved when true.
+        assert!(
+            serde_json::to_value(&detached)
+                .unwrap()
+                .get("ipc_envelope")
+                .is_none()
+        );
+        let with_env = detached
+            .with_protocol_version("2.0")
+            .with_ipc_envelope(true);
+        let env_json = serde_json::to_value(&with_env).unwrap();
+        assert_eq!(env_json["ipc_envelope"], true);
+        assert_eq!(
+            serde_json::from_value::<DaemonInfo>(env_json).unwrap(),
+            with_env
+        );
     }
 }

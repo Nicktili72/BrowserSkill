@@ -16,9 +16,18 @@ documentation = "https://docs.rs/bsk-protocol"
 serde = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
-schemars = { workspace = true }
+# Rows keep column order on the wire and in CLI output.
+indexmap = { version = "2", features = ["serde"] }
+schemars = { workspace = true, features = ["indexmap2"] }
 thiserror = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.13"
 
 [[bin]]
 name = "dump-schema"
 path = "src/bin/dump-schema.rs"
+
+[[bin]]
+name = "export-protocol"
+path = "src/bin/export-protocol.rs"

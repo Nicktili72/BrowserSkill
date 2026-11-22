@@ -1,16 +1,18 @@
+import type { FrameNodeHandle } from "@/browser-driver/frame-handles";
 import type { VisualCandidate } from "@/tools/vom/visual-discovery";
 
-/** Session-local refs describe the latest observation. Reusing eN does not identify
- * which observation a caller read; generation is internal bookkeeping only. */
 export type BackendNodeId = number;
 
 export interface DomRefEntry {
   readonly kind: "dom";
   name?: string;
+  rowAnchor?: string;
   backendNodeId: BackendNodeId;
   tabId: number | null;
   frameId?: string;
-  cdpSessionId?: string;
+  loaderId?: string;
+  documentElementBackendNodeId?: number;
+  handle?: FrameNodeHandle;
   generation: number;
 }
 
@@ -21,21 +23,115 @@ export interface VisualRefInput {
 
 export type RefEntry = DomRefEntry | (VisualRefInput & { readonly generation: number });
 
-export type RefInput =
-  | VisualRefInput
-  | BackendNodeId
-  | {
-      name?: string;
-      backendNodeId: BackendNodeId;
-      tabId: number;
-      frameId?: string;
-      cdpSessionId?: string;
-    };
+export interface DomRefInput {
+  name?: string;
+  rowAnchor?: string;
+  backendNodeId: BackendNodeId;
+  tabId: number;
+  frameId?: string;
+  loaderId?: string;
+  documentElementBackendNodeId?: number;
+}
+
+export type RefInput = VisualRefInput | BackendNodeId | DomRefInput;
+
+function buildDomHandle(
+  tabId: number,
+  backendNodeId: BackendNodeId,
+  frameId?: string,
+  loaderId?: string,
+  documentElementBackendNodeId?: number,
+): FrameNodeHandle {
+  return {
+    tabId,
+    frameId: frameId ?? "",
+    loaderId: loaderId ?? "",
+    backendNodeId,
+    ...(documentElementBackendNodeId !== undefined ? { documentElementBackendNodeId } : {}),
+  };
+}
 
 export class RefStore {
   private map = new Map<string, RefEntry>();
   private generation = 0;
+  private observationToken = crypto.randomUUID();
+  private stable = false;
+  private nextRef = 1;
+  private readonly identities = new Map<number, Map<string, string>>();
   private readonly documents = new Map<number, number>();
+
+  get stableRefsEnabled(): boolean {
+    return this.stable;
+  }
+
+  /** Negotiate once, before publishing the first observation under the new policy. */
+  enableStableRefs(): void {
+    if (this.stable) return;
+    this.stable = true;
+    this.clear();
+  }
+
+  /** Prepare a fresh publication without mutating this store or recycling issued names. */
+  createObservationStore(): RefStore {
+    const store = new RefStore();
+    store.nextRef = this.nextRef;
+    store.generation = this.generation;
+    for (const [tabId, revision] of this.documents) store.documents.set(tabId, revision);
+    return store;
+  }
+
+  private domIdentityKey(input: DomRefInput): string {
+    return JSON.stringify([
+      this.documentRevision(input.tabId),
+      input.frameId ?? "",
+      input.loaderId ?? "",
+      input.backendNodeId,
+    ]);
+  }
+
+  /** Compute the ref names `allocateRef` would assign for a batch without mutating the store. */
+  previewRefs(inputs: readonly DomRefInput[]): string[] {
+    const staged = new Map<string, string>();
+    let nextRef = this.nextRef;
+    return inputs.map((input) => {
+      const key = this.domIdentityKey(input);
+      const existing = this.identities.get(input.tabId)?.get(key);
+      if (existing) return existing;
+      const stagedKey = `${input.tabId}\u0000${key}`;
+      let ref = staged.get(stagedKey);
+      if (!ref) {
+        ref = `e${nextRef++}`;
+        staged.set(stagedKey, ref);
+      }
+      return ref;
+    });
+  }
+
+  /** Reserve a name while rendering; only published rows become actionable. */
+  allocateRef(input: DomRefInput | VisualRefInput): string {
+    if ("kind" in input) return this.allocateVisualRef();
+    let tab = this.identities.get(input.tabId);
+    if (!tab) {
+      tab = new Map();
+      this.identities.set(input.tabId, tab);
+    }
+    const key = this.domIdentityKey(input);
+    let ref = tab.get(key);
+    if (!ref) {
+      ref = `e${this.nextRef++}`;
+      tab.set(key, ref);
+    }
+    return ref;
+  }
+
+  /** Visual regions remain observation-scoped even when DOM refs are stable. */
+  allocateVisualRef(): string {
+    return `e${this.nextRef++}`;
+  }
+
+  get observationId(): string {
+    return this.observationToken;
+  }
 
   get revision(): number {
     return this.generation;
@@ -61,15 +157,21 @@ export class RefStore {
   }
 
   /**
-   * Replace the entire store with a new ref → CDP node identity mapping.
-   * Used after every fresh `tool.snapshot`.
+   * Publish a new observation. Stable DOM refs survive supplementary reads;
+   * screenshot regions always belong to the most recently published page.
    */
   replace(entries: Iterable<readonly [string, RefInput]>): void {
     const generation = this.generation + 1;
-    const next = new Map<string, RefEntry>();
-    for (const [ref, input] of entries) next.set(normaliseRef(ref), this.entry(input, generation));
+    const next = this.stable
+      ? new Map([...this.map].filter(([, entry]) => entry.kind === "dom"))
+      : new Map<string, RefEntry>();
+    for (const [ref, input] of entries) {
+      this.reserveRef(ref);
+      next.set(normaliseRef(ref), this.entry(input, generation));
+    }
     this.map = next;
     this.generation = generation;
+    this.observationToken = crypto.randomUUID();
   }
 
   set(
@@ -78,15 +180,50 @@ export class RefStore {
     opts: {
       tabId?: number;
       frameId?: string;
-      cdpSessionId?: string;
+      loaderId?: string;
+      documentElementBackendNodeId?: number;
+      name?: string;
+      rowAnchor?: string;
     } = {},
   ): void {
-    this.map.set(normaliseRef(ref), {
+    this.reserveRef(ref);
+    const key = normaliseRef(ref);
+    const tabId = opts.tabId ?? null;
+    const existing = this.map.get(key);
+    const sameNode =
+      existing?.kind === "dom" &&
+      existing.backendNodeId === id &&
+      existing.tabId === tabId &&
+      (existing.frameId ?? "") === (opts.frameId ?? "") &&
+      (existing.loaderId ?? "") === (opts.loaderId ?? "") &&
+      (existing.documentElementBackendNodeId === undefined ||
+        opts.documentElementBackendNodeId === undefined ||
+        existing.documentElementBackendNodeId === opts.documentElementBackendNodeId);
+    const name = opts.name ?? (sameNode ? existing.name : undefined);
+    const rowAnchor = opts.rowAnchor ?? (sameNode ? existing.rowAnchor : undefined);
+    const documentElementBackendNodeId =
+      opts.documentElementBackendNodeId ??
+      (sameNode ? existing.documentElementBackendNodeId : undefined);
+    this.map.set(key, {
       kind: "dom",
+      ...(name ? { name } : {}),
+      ...(rowAnchor ? { rowAnchor } : {}),
       backendNodeId: id,
-      tabId: opts.tabId ?? null,
+      tabId,
       ...(opts.frameId ? { frameId: opts.frameId } : {}),
-      ...(opts.cdpSessionId ? { cdpSessionId: opts.cdpSessionId } : {}),
+      ...(opts.loaderId ? { loaderId: opts.loaderId } : {}),
+      ...(documentElementBackendNodeId !== undefined ? { documentElementBackendNodeId } : {}),
+      ...(tabId !== null
+        ? {
+            handle: buildDomHandle(
+              tabId,
+              id,
+              opts.frameId,
+              opts.loaderId,
+              documentElementBackendNodeId,
+            ),
+          }
+        : {}),
       generation: this.generation,
     });
   }
@@ -98,24 +235,91 @@ export class RefStore {
   /** A CDP node id may be reused by a new document in the same tab. */
   invalidateTab(tabId: number): void {
     this.documents.set(tabId, this.documentRevision(tabId) + 1);
+    this.identities.delete(tabId);
     let changed = false;
     for (const [ref, entry] of this.map) {
-      const owner = entry.kind === "dom" ? entry.tabId : entry.candidate.document.target.tabId;
+      const owner = entry.kind === "dom" ? entry.tabId : entry.candidate.document.tabId;
       if (owner === tabId) {
         this.map.delete(ref);
         changed = true;
       }
     }
-    if (changed) this.generation++;
+    if (changed) {
+      this.generation++;
+      this.observationToken = crypto.randomUUID();
+    }
+  }
+
+  /** Drop child-frame DOM and visual refs whose frame disappeared or navigated across soft-detach. */
+  invalidateChildFrames(
+    tabId: number,
+    staleFrameIds: ReadonlySet<string>,
+    forceRevisionBump = false,
+  ): void {
+    if (staleFrameIds.size === 0) return;
+    const tabIdentities = this.identities.get(tabId);
+    if (tabIdentities) {
+      for (const key of tabIdentities.keys()) {
+        try {
+          const parsed = JSON.parse(key) as [unknown, unknown, unknown, unknown];
+          const frameId = typeof parsed[1] === "string" ? parsed[1] : undefined;
+          if (frameId !== undefined && staleFrameIds.has(frameId)) {
+            tabIdentities.delete(key);
+          }
+        } catch {
+          tabIdentities.delete(key);
+        }
+      }
+      if (tabIdentities.size === 0) this.identities.delete(tabId);
+    }
+    let changed = false;
+    for (const [ref, entry] of this.map) {
+      if (entry.kind === "dom") {
+        if (
+          entry.tabId === tabId &&
+          entry.frameId !== undefined &&
+          staleFrameIds.has(entry.frameId)
+        ) {
+          this.map.delete(ref);
+          changed = true;
+        }
+        continue;
+      }
+      if (entry.candidate.document.tabId !== tabId) continue;
+      let framePath = entry.candidate.framePath;
+      let isStaleVisual = staleFrameIds.has(entry.candidate.document.frameId);
+      while (!isStaleVisual && framePath) {
+        if (staleFrameIds.has(framePath.document.frameId)) {
+          isStaleVisual = true;
+          break;
+        }
+        framePath = framePath.parent?.frame;
+      }
+      if (isStaleVisual) {
+        this.map.delete(ref);
+        changed = true;
+      }
+    }
+    if (changed || forceRevisionBump) {
+      this.generation++;
+      this.observationToken = crypto.randomUUID();
+    }
   }
 
   clear(): void {
     this.generation++;
     this.map.clear();
+    this.identities.clear();
+    this.observationToken = crypto.randomUUID();
   }
 
   entries(): IterableIterator<[string, RefEntry]> {
     return this.map.entries();
+  }
+
+  private reserveRef(ref: string): void {
+    const match = /^@?e(\d+)$/.exec(ref);
+    if (match) this.nextRef = Math.max(this.nextRef, Number(match[1]) + 1);
   }
 
   private entry(input: RefInput, generation: number): RefEntry {
@@ -124,7 +328,7 @@ export class RefStore {
       if (
         !document?.attachmentId ||
         !document.frameId ||
-        !Number.isSafeInteger(document.target?.tabId) ||
+        !Number.isSafeInteger(document.tabId) ||
         !Number.isSafeInteger(document.documentElementBackendNodeId) ||
         document.documentElementBackendNodeId <= 0 ||
         !Number.isSafeInteger(input.candidate.backendNodeId) ||
@@ -145,10 +349,21 @@ export class RefStore {
     return {
       kind: "dom",
       ...(input.name ? { name: input.name } : {}),
+      ...(input.rowAnchor ? { rowAnchor: input.rowAnchor } : {}),
       backendNodeId: input.backendNodeId,
       tabId: input.tabId,
       ...(input.frameId ? { frameId: input.frameId } : {}),
-      ...(input.cdpSessionId ? { cdpSessionId: input.cdpSessionId } : {}),
+      ...(input.loaderId ? { loaderId: input.loaderId } : {}),
+      ...(input.documentElementBackendNodeId !== undefined
+        ? { documentElementBackendNodeId: input.documentElementBackendNodeId }
+        : {}),
+      handle: buildDomHandle(
+        input.tabId,
+        input.backendNodeId,
+        input.frameId,
+        input.loaderId,
+        input.documentElementBackendNodeId,
+      ),
       generation,
     };
   }

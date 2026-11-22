@@ -13,6 +13,12 @@ export interface Viewport {
 
 export type LayerKind = "page" | "modal" | "mask";
 
+export interface VomSelectOption {
+  value: string;
+  label: string;
+  selected?: boolean;
+}
+
 /**
  * CDP-free data slice consumed by packages/vom.
  * The extension joins AX semantics and DOMSnapshot geometry by backendNodeId
@@ -34,23 +40,41 @@ export interface VomNode {
   value?: string;
   /** Checked state is separate from the control's submitted value. */
   checked?: boolean | "mixed";
+  /** Browser accessibility focus, used to protect implicit keyboard recipients. */
+  focused?: boolean;
   placeholder?: string;
+  /** Native form ownership, or raw DOM form containment for custom widgets.
+   * Absence means unknown, never proof that a control is outside a form. */
+  inForm?: boolean;
   inputState?: "empty" | "filled" | "default" | "unknown";
   href?: string; // hostname of external link target; omitted for same-origin links
   text?: string;
   nearbyText?: string;
+  selectOptions?: VomSelectOption[];
+  selectOptionsTruncated?: boolean;
+  rowAnchor?: string;
 
   tag: string;
   rect: Rect | null;
   paintOrder: number;
+  /** Parsed integer CSS `z-index` when explicitly set (absent for `auto`). */
+  zIndex?: number;
   position: string;
   pointerEvents: string;
   cursor?: string;
+  /** Derived interaction hint; false suppresses an inherited cursor hint. */
+  dragHint?: "draggable" | "drag-handle" | "drop-target" | false;
+  /** Browser-reported clickability, independent of role and inline attributes. */
+  clickable?: boolean;
   attrs?: Record<string, string>;
   domParentId?: number | null;
   domAncestorIds?: number[];
 
   modal?: boolean;
+  /** Accessibility/ARIA popup trigger state (`aria-haspopup` / AX `hasPopup`). */
+  hasPopup?: boolean;
+  /** Accessibility/ARIA expansion state (`aria-expanded` / AX `expanded`). */
+  expanded?: boolean;
   sensitive?: boolean;
   disabled?: boolean;
   inert?: boolean;
@@ -85,6 +109,8 @@ export interface VomScene {
 export interface VomOptions {
   maxDepth?: number;
   maxTokens?: number;
+  /** Allocate names from a caller-owned identity store, before measuring row tokens. */
+  allocateRef?: (node: VomNode) => string;
   /**
    * When true, form values are rendered as masks instead of literal values.
    */
@@ -120,8 +146,27 @@ export interface RenderedRef extends VomRef {
   role?: string;
   name?: string;
   ctx?: string;
+  rowAnchor?: string;
   /** Zero-based line index in `VomResult.text`. */
   line: number;
+}
+
+export interface VomLineMetadata {
+  indent: number;
+  kind: "header" | "layer" | "context" | "active-scope" | "notice" | "node";
+  ref?: string;
+  role?: string;
+  /** JSON-escaped inner text of the line's primary quoted name, if present. */
+  escapedName?: string;
+  /** Start/end character offsets of `escapedName` inside the raw line (excluding surrounding quotes). */
+  nameStart?: number;
+  nameEnd?: number;
+  /** Character offset where post-prefix page content begins on the raw line, if any. */
+  contentStart?: number;
+  /** True when the line is strictly `role "name"` without `@eN` or trailing annotations. */
+  plainNamedNode: boolean;
+  /** True when the renderer may cut the line's primary label without appending `…`. */
+  silentlyTruncatesLabel: boolean;
 }
 
 export interface VomResult {

@@ -3,35 +3,28 @@ import { Badge, Button, Input, Label } from "@browser-skill/ui";
 import { RiArrowLeftLine, RiArrowRightSLine, RiCheckLine, RiFileCopyLine } from "@remixicon/react";
 import { type ChangeEvent, useEffect, useState } from "react";
 import { AuditPanel } from "@/components/audit-panel";
-import { compareProtocol } from "@/lib/semver";
 import { PROTOCOL_VERSION } from "@/transport/handshake";
 import functionIconUrl from "../../../assets/function.svg";
-import { BrowserLabel } from "./browser-label";
+import { BrowserProfile } from "./browser-profile";
 import { ConnectionSettings } from "./connection-settings";
 import { ConnectionStatusIndicator } from "./connection-status-indicator";
 import { CurrentTasks } from "./current-tasks";
+import { DaemonUpgradeNotice } from "./daemon-upgrade-notice";
 import { DebugPanel } from "./debug-panel";
 import { POPUP_FEATURES, type PopupView } from "./features";
 import { InteractionSettings } from "./interaction-settings";
 import { LongScreenshot } from "./long-screenshot";
-import { ProfileInstructions } from "./profile-instructions";
 import { SettingInfo } from "./setting-info";
 import { Switch } from "./switch";
 import { type PopupStatusState, useConnectionState } from "./use-connection-state";
 import { useControlHintsHidden } from "./use-control-hints-hidden";
+import { VideoPanel } from "./video-panel";
 
 const STATE_LABEL_KEYS = {
   disconnected: "popup.stateLabel.disconnected",
   connected: "popup.stateLabel.connected",
   version_skew: "popup.stateLabel.version_skew",
   disabled: "popup.stateLabel.disabled",
-} as const satisfies Record<PopupStatusState, string>;
-
-const STATE_BADGE_KEYS = {
-  disconnected: "popup.stateBadge.disconnected",
-  connected: "popup.stateBadge.connected",
-  version_skew: "popup.stateBadge.version_skew",
-  disabled: "popup.stateBadge.disabled",
 } as const satisfies Record<PopupStatusState, string>;
 
 function getLogoSrc() {
@@ -85,10 +78,14 @@ export function App() {
   const isSkewed = statusState === "version_skew";
   const isDisconnected = statusState === "disconnected";
   const connectionLive = statusState === "connected" || isSkewed;
-  const daemonVersion = snapshot.handshake?.version ?? "—";
+  const daemonUpgrade =
+    snapshot.connectionEnabled &&
+    snapshot.state !== "connected" &&
+    snapshot.state !== "version_skew"
+      ? snapshot.daemonUpgradeRequired
+      : null;
+  const daemonVersion = snapshot.handshake?.version ?? daemonUpgrade?.daemonVersion ?? "—";
   const daemonProtocol = snapshot.handshake?.protocol_version ?? "—";
-  const interactionProtocolOrder = compareProtocol(daemonProtocol, "1.3");
-  const legacyInteraction = interactionProtocolOrder !== null && interactionProtocolOrder < 0;
   const extensionVersion = snapshot.extensionVersion || "—";
   const instanceId = snapshot.instanceId || "—";
 
@@ -123,17 +120,19 @@ export function App() {
   };
 
   const headerTitle =
-    view === "features"
-      ? t("popup.launcher.title")
-      : view === "debug"
-        ? t("debug.title")
-        : view === "record"
-          ? t("popup.record.sectionTitle")
-          : view === "long-screenshot"
-            ? t("longScreenshot.title")
-            : view === "audit"
-              ? t("audit.title")
-              : t("popup.brandName");
+    view === "video"
+      ? t("video.title")
+      : view === "features"
+        ? t("popup.launcher.title")
+        : view === "debug"
+          ? t("debug.title")
+          : view === "record"
+            ? t("popup.record.sectionTitle")
+            : view === "long-screenshot"
+              ? t("longScreenshot.title")
+              : view === "audit"
+                ? t("audit.title")
+                : t("popup.brandName");
 
   return (
     <main
@@ -189,6 +188,10 @@ export function App() {
         )}
       </header>
 
+      {daemonUpgrade && <DaemonUpgradeNotice upgrade={daemonUpgrade} error={snapshot.lastError} />}
+
+      {view === "video" && <VideoPanel />}
+
       {view === "main" && (
         <>
           <section
@@ -197,19 +200,58 @@ export function App() {
           >
             <div className="flex items-center justify-between gap-2" data-slot="popup-status">
               <div className="flex min-w-0 items-center gap-2">
-                <ConnectionStatusIndicator state={statusState} />
+                <ConnectionStatusIndicator
+                  state={statusState}
+                  className={
+                    statusState === "disabled"
+                      ? undefined
+                      : ["pairing_required", "server_unverified", "daemon_too_old"].includes(
+                            snapshot.localAuth?.state ?? "",
+                          )
+                        ? "bg-destructive"
+                        : undefined
+                  }
+                />
                 <span className="truncate text-sm font-medium" data-slot="popup-state-label">
-                  {t(STATE_LABEL_KEYS[statusState])}
+                  {t(
+                    statusState !== "disabled" && snapshot.localAuth?.state === "pairing_required"
+                      ? "popup.localAuth.required"
+                      : STATE_LABEL_KEYS[statusState],
+                  )}
                 </span>
               </div>
               <div className="flex shrink-0 items-center gap-2">
-                <Badge
-                  variant="outline"
-                  className="px-1.5 py-0 text-[10px] font-medium uppercase"
-                  data-slot="popup-state-badge"
-                >
-                  {t(STATE_BADGE_KEYS[statusState])}
-                </Badge>
+                {connectionLive && snapshot.localAuth === null && (
+                  <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+                    {t("popup.connectionRemote")}
+                  </Badge>
+                )}
+                {connectionLive &&
+                  snapshot.localAuth &&
+                  ["verified", "unverified_local"].includes(snapshot.localAuth.state) && (
+                    <Badge
+                      variant="outline"
+                      className="px-1.5 py-0 text-[10px]"
+                      data-slot="local-auth-badge"
+                    >
+                      {t(
+                        snapshot.localAuth.state === "verified"
+                          ? "popup.localAuth.verified"
+                          : snapshot.localAuth.reason === "unpaired"
+                            ? "popup.localAuth.unpaired"
+                            : "popup.localAuth.unverified",
+                      )}
+                    </Badge>
+                  )}
+                {isSkewed && (
+                  <Badge
+                    variant="outline"
+                    className="px-1.5 py-0 text-[10px] font-medium uppercase"
+                    data-slot="popup-state-badge"
+                  >
+                    {t("popup.stateBadge.version_skew")}
+                  </Badge>
+                )}
                 <Switch
                   checked={snapshot.connectionEnabled}
                   onCheckedChange={setConnectionEnabled}
@@ -223,27 +265,28 @@ export function App() {
                 className="mt-2 text-xs leading-snug text-muted-foreground"
                 data-slot="popup-version-skew-warning"
               >
-                {t(
-                  legacyInteraction
-                    ? "popup.interactionCompatibilityWarning"
-                    : "popup.versionSkewWarning",
-                  {
-                    extensionProtocol: PROTOCOL_VERSION,
-                    cliProtocol: daemonProtocol,
-                  },
-                )}
+                {t("popup.versionSkewWarning", {
+                  extensionProtocol: PROTOCOL_VERSION,
+                  cliProtocol: daemonProtocol,
+                })}
               </p>
             )}
-            <ConnectionSettings
-              connectionEnabled={snapshot.connectionEnabled}
-              disconnected={isDisconnected && !snapshot.lastError}
-            />
-            <BrowserLabel
+            <BrowserProfile
               label={snapshot.label}
+              instanceId={snapshot.instanceId}
+              connected={
+                snapshot.connectionEnabled &&
+                (snapshot.state === "connected" || snapshot.state === "version_skew")
+              }
               sessionCount={snapshot.sessionCount}
               onSave={setLabel}
             />
-            <ProfileInstructions instanceId={snapshot.instanceId} connected={connectionLive} />
+            <ConnectionSettings
+              connectionEnabled={snapshot.connectionEnabled}
+              disconnected={isDisconnected && !snapshot.lastError && !daemonUpgrade}
+              localAuth={snapshot.localAuth}
+              instanceId={snapshot.instanceId}
+            />
           </section>
 
           <section
@@ -275,7 +318,7 @@ export function App() {
 
           <CurrentTasks enabled={connectionLive} />
 
-          {snapshot.lastError && (
+          {snapshot.lastError && !daemonUpgrade && (
             <div
               className="rounded-lg border border-destructive/25 bg-destructive/10 px-3 py-2 text-xs leading-snug text-destructive"
               data-slot="popup-error"

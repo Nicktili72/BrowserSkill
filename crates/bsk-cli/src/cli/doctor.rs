@@ -10,11 +10,16 @@ use serde::Serialize;
 use crate::cli::browser_wait::{
     browser_query_ipc_timeout, doctor_browser_connect_wait, wait_for_browser_ms,
 };
-use crate::cli::ensure_daemon::{AUTO_START_DISABLED_HINT, auto_start_enabled, ensure_daemon};
+use crate::cli::ensure_daemon::{auto_start_enabled, ensure_daemon};
 use crate::cli::status::Output;
+use crate::cli::update::{
+    self,
+    state::{Recovery, SkipReason, UpdateRecord, UpdateResult, UpdateSource, UpdateStage},
+};
 use crate::daemon::info::DaemonInfo;
 use crate::daemon::paths;
 use crate::daemon::probe::{self, Probe};
+use crate::daemon::start_error::{DaemonStartFailure, recovery_hint};
 use crate::daemon::state::PROTOCOL_VERSION;
 
 /// Chrome Web Store listing for the browser-skill extension.
@@ -128,7 +133,7 @@ fn resolve_daemon_state(output: Output) -> DaemonState {
 
     if matches!(state, DaemonState::Missing | DaemonState::NoListener(_)) && auto_start_enabled() {
         if let Err(err) = ensure_daemon() {
-            return DaemonState::ProbeError(format!("{err:#}"));
+            return DaemonState::ProbeError(err);
         }
         state = current_state(Duration::ZERO);
     }
@@ -140,7 +145,11 @@ fn resolve_daemon_state(output: Output) -> DaemonState {
     };
 
     if wait > Duration::ZERO && output == Output::Human {
-        eprintln!("waiting for browser extension to connect…");
+        // Issue #465 §5: name the two possible causes up front so an
+        // installed-but-disconnected extension is not read as "missing".
+        eprintln!(
+            "waiting for browser extension to connect… (if it is installed: check that a window with the extension enabled is open in the expected profile and that it targets this daemon; reinstall from the store if missing)"
+        );
     }
 
     if wait.is_zero() {
@@ -162,10 +171,12 @@ fn needs_browser_wait(state: &DaemonState) -> bool {
 enum DaemonState {
     Missing,
     NoListener(DaemonInfo),
-    ProbeError(String),
+    ProbeError(anyhow::Error),
     Verified {
-        status: StatusResult,
+        status: Box<StatusResult>,
         local_identity_error: Option<String>,
+        /// Owned by a terminal or supervisor, which must restart it.
+        host_managed: bool,
     },
 }
 
@@ -176,6 +187,16 @@ impl DaemonState {
             _ => None,
         }
     }
+
+    fn host_managed(&self) -> bool {
+        matches!(
+            self,
+            DaemonState::Verified {
+                host_managed: true,
+                ..
+            }
+        )
+    }
 }
 
 fn collect_checks(state: DaemonState) -> Vec<CheckResult> {
@@ -185,9 +206,194 @@ fn collect_checks(state: DaemonState) -> Vec<CheckResult> {
         check_daemon_running(&state),
         check_daemon_management(&state),
         check_version_compatible(state.status()),
+        check_auto_update(state.status(), state.host_managed()),
         check_extension_connected(state.status()),
+        check_local_auth(state.status()),
         check_browsers_protocol_compatible(state.status()),
     ]
+}
+
+/// An attempt still `in_progress` after this long was interrupted.
+const UPDATE_STALLED_AFTER_SECS: u64 = 10 * 60;
+
+fn check_auto_update(status: Option<&StatusResult>, host_managed: bool) -> CheckResult {
+    let leftovers = std::env::current_exe()
+        .map(|exe| update::update_leftovers(&exe))
+        .unwrap_or_default();
+    auto_update_check(
+        update::state::current().as_ref(),
+        status.map(|status| (status.daemon_version.as_str(), host_managed)),
+        env!("CARGO_PKG_VERSION"),
+        &leftovers,
+        update::now_epoch_secs(),
+    )
+}
+
+/// Report the recorded update attempt as it happened, rather than inferring
+/// it from which versions exist. `daemon` is the running daemon's version and
+/// whether its terminal or supervisor owns it.
+fn auto_update_check(
+    record: Option<&UpdateRecord>,
+    daemon: Option<(&str, bool)>,
+    installed_version: &str,
+    leftovers: &[update::Leftover],
+    now: u64,
+) -> CheckResult {
+    let name = "auto-update";
+    let mut details = Vec::new();
+    let mut hints = Vec::new();
+    if let Some((daemon_version, host_managed)) =
+        daemon.filter(|(version, _)| *version != installed_version)
+    {
+        details.push(format!(
+            "the daemon runs bsk {daemon_version}, the installed bsk is {installed_version}"
+        ));
+        hints.push(if host_managed {
+            "restart the daemon in its terminal or supervisor to run the installed version"
+                .to_string()
+        } else {
+            "restart the daemon with `bsk daemon restart` to run the installed version".to_string()
+        });
+    }
+    match record {
+        None => details.push("no update attempt recorded".to_string()),
+        Some(record) => describe_update(record, installed_version, now, &mut details, &mut hints),
+    }
+    if !leftovers.is_empty() {
+        let names = leftovers
+            .iter()
+            .map(|leftover| leftover.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!(
+            "kept from earlier updates until nothing runs them: {names}"
+        ));
+    }
+    let detail = details.join("; ");
+    if hints.is_empty() {
+        CheckResult::ok(name, detail)
+    } else {
+        CheckResult::warn(name, detail, hints.join("; "))
+    }
+}
+
+fn describe_update(
+    record: &UpdateRecord,
+    installed_version: &str,
+    now: u64,
+    details: &mut Vec<String>,
+    hints: &mut Vec<String>,
+) {
+    let attempt = format!(
+        "{} {} -> {} ({})",
+        match record.source {
+            UpdateSource::Daemon => "auto-update",
+            UpdateSource::Command => "`bsk update`",
+        },
+        record.from_version,
+        record.target_version,
+        ago(now, record.updated_at_epoch_secs),
+    );
+    let stage = record.stage.map_or("", |stage| match stage {
+        UpdateStage::Download => " while downloading",
+        UpdateStage::Install => " while installing",
+        UpdateStage::Handover => " while handing over to the new daemon",
+        UpdateStage::Restart => " while restarting the daemon",
+    });
+    // An attempt at a version that is installed by now needs no action.
+    let superseded = semver::Version::parse(&record.target_version)
+        .ok()
+        .zip(semver::Version::parse(installed_version).ok())
+        .is_some_and(|(target, installed)| target <= installed);
+    let retry = "run `bsk update` to try again now, and check `bsk logs` for details";
+    match record.result {
+        UpdateResult::Succeeded => details.push(format!("{attempt} succeeded")),
+        UpdateResult::InProgress
+            if now.saturating_sub(record.updated_at_epoch_secs) < UPDATE_STALLED_AFTER_SECS =>
+        {
+            details.push(format!("{attempt} in progress{stage}"));
+        }
+        UpdateResult::InProgress => {
+            details.push(format!(
+                "{attempt} stopped{stage}; the process running it exited"
+            ));
+            if !superseded {
+                hints.push(retry.to_string());
+            }
+        }
+        UpdateResult::Failed => {
+            let error = record.error.as_deref().unwrap_or("unknown error");
+            let recovery = match &record.recovery {
+                Some(Recovery::Unchanged) | None => "nothing was changed".to_string(),
+                Some(Recovery::Restored {
+                    daemon_serving: true,
+                }) => "the previous version was restored and a daemon kept serving".to_string(),
+                Some(Recovery::Restored {
+                    daemon_serving: false,
+                }) => {
+                    hints.push("start the daemon with `bsk daemon start`".to_string());
+                    "the previous version was restored, but no daemon was left serving".to_string()
+                }
+                Some(Recovery::RestoreFailed { action }) => {
+                    hints.push(action.clone());
+                    "the previous executable could not be put back".to_string()
+                }
+            };
+            let mut detail = format!("{attempt} failed{stage}: {error}; {recovery}");
+            if let Some(retry_after) = record.retry_after_epoch_secs.filter(|at| *at > now) {
+                detail.push_str(&format!(
+                    "; the daemon retries in {}",
+                    duration(retry_after - now)
+                ));
+            }
+            details.push(detail);
+            if !superseded {
+                hints.push(retry.to_string());
+            }
+        }
+        UpdateResult::Skipped => {
+            details.push(match record.skip_reason {
+                Some(SkipReason::HostManaged) => format!(
+                    "bsk {} is available; this daemon belongs to its terminal or supervisor",
+                    record.target_version
+                ),
+                Some(SkipReason::NotWritable) | None => format!(
+                    "bsk {} is available, but bsk cannot write next to {}{}",
+                    record.target_version,
+                    record.executable.display(),
+                    record
+                        .error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                ),
+            });
+            if !superseded {
+                hints.push(match record.skip_reason {
+                    Some(SkipReason::HostManaged) => {
+                        "run `bsk update`, then restart the daemon in its terminal or supervisor"
+                            .to_string()
+                    }
+                    Some(SkipReason::NotWritable) | None => {
+                        update::installer_hint(&record.executable)
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn ago(now: u64, then: u64) -> String {
+    format!("{} ago", duration(now.saturating_sub(then)))
+}
+
+fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 fn current_state(browser_wait: Duration) -> DaemonState {
@@ -201,11 +407,12 @@ fn current_state(browser_wait: Duration) -> DaemonState {
                 .require_local_pid()
                 .err()
                 .map(|err| format!("{err:#}")),
-            status: daemon.status,
+            host_managed: daemon.info.host_managed,
+            status: Box::new(daemon.status),
         },
         Ok(Probe::Absent(Some(info))) => DaemonState::NoListener(info),
         Ok(Probe::Absent(None)) => DaemonState::Missing,
-        Err(err) => DaemonState::ProbeError(format!("{err:#}")),
+        Err(err) => DaemonState::ProbeError(err),
     }
 }
 
@@ -279,6 +486,9 @@ fn skill_check_from_report(report: &crate::skill_install::sync::SyncReport) -> C
     if !details.is_empty() {
         details.insert(0, format!("bundled bsk v{}", env!("CARGO_PKG_VERSION")));
     }
+    if !report.updated.is_empty() {
+        details.push("reload the updated BrowserSkill skill in the agent, or start a new agent conversation; an existing conversation may retain old instructions".into());
+    }
     let detail = details.join("; ");
 
     if !report.errors.is_empty() {
@@ -314,7 +524,7 @@ fn check_daemon_running(state: &DaemonState) -> CheckResult {
             if auto_start_enabled() {
                 "run `bsk daemon start` or any `bsk` command (daemon is auto-spawned)"
             } else {
-                AUTO_START_DISABLED_HINT
+                DaemonStartFailure::AutoStartDisabled.hint()
             },
         ),
         DaemonState::NoListener(info) => CheckResult::fail(
@@ -327,13 +537,15 @@ fn check_daemon_running(state: &DaemonState) -> CheckResult {
             if auto_start_enabled() {
                 "run `bsk daemon start`; check `bsk logs` if startup fails"
             } else {
-                AUTO_START_DISABLED_HINT
+                DaemonStartFailure::AutoStartDisabled.hint()
             },
         ),
         DaemonState::ProbeError(err) => CheckResult::fail(
             name,
-            err.clone(),
-            "check daemon IPC permissions and `bsk logs`; keep existing runtime files",
+            format!("{err:#}"),
+            recovery_hint(err).unwrap_or(
+                "check daemon IPC permissions and `bsk logs`; keep existing runtime files",
+            ),
         ),
     }
 }
@@ -361,24 +573,35 @@ fn check_version_compatible(status: Option<&StatusResult>) -> CheckResult {
     let Some(status) = status else {
         return CheckResult::fail(name, "daemon status unavailable", "start the daemon first");
     };
-    let ok = status.protocol_version == PROTOCOL_VERSION;
-    if ok {
-        CheckResult::ok(
+    match bsk_protocol::evaluate_handshake_compat(
+        &status.protocol_version,
+        None,
+        PROTOCOL_VERSION,
+        bsk_protocol::catalog::MIN_COMPATIBLE_PROTOCOL,
+    ) {
+        bsk_protocol::HandshakeCompat::Ok => CheckResult::ok(
             name,
             format!(
                 "daemon protocol {} (app {})",
                 status.protocol_version, status.daemon_version
             ),
-        )
-    } else {
-        CheckResult::fail(
+        ),
+        bsk_protocol::HandshakeCompat::Skew => CheckResult::warn(
+            name,
+            format!(
+                "daemon protocol {} and CLI protocol {} differ within compatible minor range",
+                status.protocol_version, PROTOCOL_VERSION
+            ),
+            "upgrade and restart the older component if any newer option is unavailable",
+        ),
+        bsk_protocol::HandshakeCompat::Reject { reason } => CheckResult::fail(
             name,
             format!(
                 "daemon protocol {} (expected {}), app {}",
                 status.protocol_version, PROTOCOL_VERSION, status.daemon_version
             ),
-            "upgrade or restart bsk so CLI and daemon speak the same protocol version",
-        )
+            format!("{reason}; update bsk and restart its daemon (`bsk daemon stop`)"),
+        ),
     }
 }
 
@@ -440,6 +663,31 @@ fn display_protocol(value: &str) -> &str {
     if value.is_empty() { "unknown" } else { value }
 }
 
+fn check_local_auth(status: Option<&StatusResult>) -> CheckResult {
+    let mode = status
+        .and_then(|s| s.local_auth.as_ref())
+        .map(|s| s.mode.clone())
+        .or_else(|| {
+            paths::bsk_home()
+                .ok()
+                .and_then(|home| crate::daemon::local_auth::read_mode(&home).ok())
+                .and_then(|mode| serde_json::to_value(mode).ok())
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+    if mode.as_deref() == Some("trust_local") {
+        CheckResult::warn(
+            "local connection verification",
+            "unverified local connections are allowed",
+            "run `bsk daemon trust-local off` and turn off skipping in the extension to restore verification",
+        )
+    } else {
+        CheckResult::ok(
+            "local connection verification",
+            "local pairing verification is available",
+        )
+    }
+}
+
 fn check_extension_connected(status: Option<&StatusResult>) -> CheckResult {
     let name = "extension connected";
     let Some(status) = status else {
@@ -449,16 +697,51 @@ fn check_extension_connected(status: Option<&StatusResult>) -> CheckResult {
             "start the daemon and load the extension first",
         );
     };
+    if status.browsers.is_empty()
+        && status
+            .local_auth
+            .as_ref()
+            .is_some_and(|auth| auth.last_unpaired_attempt.is_some())
+    {
+        return CheckResult::fail(
+            name,
+            "extension is waiting for local pairing",
+            "run `bsk daemon pair`, then paste the link into the extension's connection settings",
+        );
+    }
     let browsers = status.browsers.len();
+    let unresponsive = status
+        .browsers
+        .iter()
+        .filter(|browser| browser.unresponsive)
+        .count();
+    if unresponsive > 0 {
+        return CheckResult::warn(
+            name,
+            format!(
+                "{unresponsive} of {browsers} browser(s) connected, but the extension is not responding"
+            ),
+            "commands fail until the extension sends another frame; reload the extension if this persists",
+        );
+    }
     if browsers > 0 {
         CheckResult::ok(name, format!("{} browser(s) connected", browsers))
     } else {
+        // Issue #465 §5: "0 browsers connected" is true for both "not
+        // installed" and "installed but not connected" (another or no
+        // browser window, wrong profile, a different daemon or port, a
+        // stale extension service worker). Spell both out so the fix
+        // does not require guessing which one applies.
         CheckResult::fail(
             name,
             "0 browsers connected",
             format!(
-                "install the extension from {EXTENSION_STORE_URL} (Chrome) \
-                 or {EXTENSION_STORE_URL_EDGE} (Edge) and load it in the browser"
+                "if the extension is not installed, install it from {EXTENSION_STORE_URL} (Chrome) \
+                 or {EXTENSION_STORE_URL_EDGE} (Edge); \
+                 if it is already installed, it is not connected to this daemon — keep a window \
+                 of that browser open with the extension enabled in the profile you are using \
+                 (the extension is per-profile), point the extension at this daemon's \
+                 address/port, and reload the extension if it was just updated"
             ),
         )
     }
@@ -516,10 +799,46 @@ mod m2_tests {
     use bsk_protocol::StatusResult;
     use bsk_protocol::system::{BrowserStatusEntry, VersionSkewEntry};
 
+    #[test]
+    fn startup_probe_errors_preserve_recovery_and_cause() {
+        for failure in [
+            DaemonStartFailure::AutoStartDisabled,
+            DaemonStartFailure::IndependentStartFailed,
+            DaemonStartFailure::BreakawayUnverified,
+            DaemonStartFailure::ProcessCreationDenied,
+            DaemonStartFailure::PartialBreakaway,
+            DaemonStartFailure::ResumeFailed,
+        ] {
+            let error = anyhow::anyhow!("startup fixture cause")
+                .context(failure)
+                .context("automatic daemon startup failed");
+            let check = check_daemon_running(&DaemonState::ProbeError(error));
+            assert_eq!(check.status, CheckStatus::Fail);
+            assert_eq!(check.hint.as_deref(), Some(failure.hint()));
+            assert!(check.detail.contains("startup fixture cause"));
+            let json = serde_json::to_value(check).unwrap();
+            assert_eq!(json["hint"], failure.hint());
+            assert_eq!(json["ok"], false);
+        }
+    }
+
+    #[test]
+    fn ordinary_probe_errors_keep_ipc_guidance() {
+        let error = anyhow::anyhow!("IPC fixture failure").context("query daemon status");
+        let check = check_daemon_running(&DaemonState::ProbeError(error));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.detail, "query daemon status: IPC fixture failure");
+        assert_eq!(
+            check.hint.as_deref(),
+            Some("check daemon IPC permissions and `bsk logs`; keep existing runtime files")
+        );
+    }
+
     fn fake_status(browsers: Vec<BrowserStatusEntry>, skew: Vec<VersionSkewEntry>) -> StatusResult {
         StatusResult {
+            local_auth: None,
             daemon_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_version: "1.0".into(),
+            protocol_version: "2.0".into(),
             pid: 1,
             uptime_secs: 0,
             ws_port: 0,
@@ -527,14 +846,172 @@ mod m2_tests {
             browsers,
             sessions: Vec::new(),
             version_skew_browsers: skew,
+            ipc_envelope: true,
         }
+    }
+
+    fn attempt(result: UpdateResult) -> UpdateRecord {
+        UpdateRecord {
+            result,
+            from_version: "0.3.1".into(),
+            target_version: "0.4.0".into(),
+            updated_at_epoch_secs: 1_000,
+            ..UpdateRecord::start(
+                UpdateSource::Daemon,
+                &semver::Version::new(0, 4, 0),
+                std::path::Path::new("/home/u/.local/bin/bsk"),
+            )
+        }
+    }
+
+    fn update_check(record: Option<&UpdateRecord>, daemon: Option<&str>) -> CheckResult {
+        auto_update_check(record, daemon.map(|v| (v, false)), "0.3.1", &[], 1_120)
+    }
+
+    #[test]
+    fn auto_update_check_reports_success_and_version_skew() {
+        let none = update_check(None, Some("0.3.1"));
+        assert_eq!(none.status, CheckStatus::Ok);
+        assert!(none.detail.contains("no update attempt recorded"));
+
+        let succeeded = update_check(Some(&attempt(UpdateResult::Succeeded)), Some("0.3.1"));
+        assert_eq!(succeeded.status, CheckStatus::Ok);
+        assert!(
+            succeeded
+                .detail
+                .contains("auto-update 0.3.1 -> 0.4.0 (2m ago) succeeded"),
+            "{}",
+            succeeded.detail
+        );
+
+        let skewed = update_check(None, Some("0.3.0"));
+        assert_eq!(skewed.status, CheckStatus::Warning);
+        assert!(skewed.detail.contains("the daemon runs bsk 0.3.0"));
+        assert!(skewed.hint.unwrap().contains("bsk daemon restart"));
+        assert!(!has_failures(&[update_check(None, Some("0.3.0"))]));
+
+        // A daemon its terminal or supervisor owns is restarted there.
+        let host = auto_update_check(None, Some(("0.3.0", true)), "0.3.1", &[], 0);
+        let hint = host.hint.unwrap();
+        assert!(hint.contains("its terminal or supervisor"), "{hint}");
+        assert!(!hint.contains("bsk daemon restart"), "{hint}");
+    }
+
+    #[test]
+    fn auto_update_check_explains_a_failure_and_its_recovery() {
+        let mut failed = attempt(UpdateResult::Failed);
+        failed.stage = Some(UpdateStage::Handover);
+        failed.error = Some("the replacement daemon (pid 7) exited with exit status: 3".into());
+        failed.recovery = Some(Recovery::Restored {
+            daemon_serving: true,
+        });
+        failed.retry_after_epoch_secs = Some(1_120 + 2 * 3600);
+
+        let check = update_check(Some(&failed), Some("0.3.1"));
+
+        assert_eq!(check.status, CheckStatus::Warning);
+        for text in [
+            "failed while handing over to the new daemon",
+            "exited with exit status: 3",
+            "the previous version was restored and a daemon kept serving",
+            "the daemon retries in 2h",
+        ] {
+            assert!(check.detail.contains(text), "{text}: {}", check.detail);
+        }
+        assert!(check.hint.unwrap().contains("bsk update"));
+
+        failed.recovery = Some(Recovery::RestoreFailed {
+            action: "stop bsk, then move /a to /b".into(),
+        });
+        let check = update_check(Some(&failed), Some("0.3.1"));
+        assert!(check.hint.unwrap().contains("stop bsk, then move /a to /b"));
+
+        // Nothing is left to do once that version is installed.
+        let superseded = auto_update_check(
+            Some(&UpdateRecord {
+                recovery: Some(Recovery::Unchanged),
+                ..failed.clone()
+            }),
+            Some(("0.4.0", false)),
+            "0.4.0",
+            &[],
+            1_120,
+        );
+        assert_eq!(superseded.status, CheckStatus::Ok, "{}", superseded.detail);
+    }
+
+    #[test]
+    fn auto_update_check_flags_an_interrupted_attempt() {
+        let mut interrupted = attempt(UpdateResult::InProgress);
+        interrupted.stage = Some(UpdateStage::Install);
+        let running = auto_update_check(Some(&interrupted), None, "0.3.1", &[], 1_060);
+        assert_eq!(running.status, CheckStatus::Ok);
+        assert!(running.detail.contains("in progress while installing"));
+
+        let stalled = auto_update_check(
+            Some(&interrupted),
+            None,
+            "0.3.1",
+            &[],
+            1_000 + UPDATE_STALLED_AFTER_SECS,
+        );
+        assert_eq!(stalled.status, CheckStatus::Warning);
+        assert!(stalled.detail.contains("stopped while installing"));
+    }
+
+    #[test]
+    fn auto_update_check_names_who_must_install_a_skipped_version() {
+        let mut skipped = attempt(UpdateResult::Skipped);
+        skipped.stage = None;
+        skipped.skip_reason = Some(SkipReason::HostManaged);
+        let host = update_check(Some(&skipped), Some("0.3.1"));
+        assert_eq!(host.status, CheckStatus::Warning);
+        assert!(
+            host.detail
+                .contains("belongs to its terminal or supervisor")
+        );
+        let hint = host.hint.unwrap();
+        assert!(
+            hint.contains(
+                "run `bsk update`, then restart the daemon in its terminal or supervisor"
+            ),
+            "{hint}"
+        );
+
+        skipped.skip_reason = Some(SkipReason::NotWritable);
+        skipped.error = Some("permission denied".into());
+        let unwritable = update_check(Some(&skipped), Some("0.3.1"));
+        assert!(
+            unwritable
+                .detail
+                .contains("cannot write next to /home/u/.local/bin/bsk: permission denied")
+        );
+        assert!(
+            unwritable
+                .hint
+                .unwrap()
+                .contains("installer or package manager")
+        );
+    }
+
+    #[test]
+    fn auto_update_check_lists_leftover_files_without_warning() {
+        let leftovers = [update::Leftover {
+            path: "/bin/.bsk.old-1-1".into(),
+            owner: Some(1),
+            expired: true,
+        }];
+        let check = auto_update_check(None, None, "0.3.1", &leftovers, 0);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.detail.contains("/bin/.bsk.old-1-1"));
     }
 
     #[test]
     fn unverified_local_identity_warns_without_failing_usable_ipc() {
         let state = DaemonState::Verified {
-            status: fake_status(Vec::new(), Vec::new()),
+            status: Box::new(fake_status(Vec::new(), Vec::new())),
             local_identity_error: Some("peer identity is unavailable".into()),
+            host_managed: false,
         };
         let running = check_daemon_running(&state);
         let management = check_daemon_management(&state);
@@ -738,6 +1215,13 @@ mod m2_tests {
             hint.contains(EXTENSION_STORE_URL_EDGE),
             "hint should include Edge Add-ons URL: {hint}"
         );
+        // Issue #465 §5: the hint must not imply "not installed" is the
+        // only possibility — an installed-but-disconnected extension is
+        // the harder case to diagnose.
+        assert!(
+            hint.contains("already installed"),
+            "hint should name the installed-but-disconnected case: {hint}"
+        );
     }
 
     #[test]
@@ -772,6 +1256,31 @@ mod m2_tests {
     }
 
     #[test]
+    fn extension_check_warns_when_a_connected_browser_is_unresponsive() {
+        let mut entry = BrowserStatusEntry {
+            instance_id: "alpha".into(),
+            browser_name: "chrome".into(),
+            browser_version: "131".into(),
+            extension_version: "0.1.0-dev.0".into(),
+            label: "Personal".into(),
+            session_count: 1,
+            connected_at_ms: 1,
+            version_skew: false,
+            extension_protocol_version: "2.0".into(),
+            unresponsive: true,
+        };
+        let status = fake_status(vec![entry.clone()], Vec::new());
+        let check = check_extension_connected(Some(&status));
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.detail.contains("not responding"));
+        assert!(check.ok);
+
+        entry.unresponsive = false;
+        let healthy = check_extension_connected(Some(&fake_status(vec![entry], Vec::new())));
+        assert_eq!(healthy.status, CheckStatus::Ok);
+    }
+
+    #[test]
     fn browsers_check_reports_na_when_no_browser_connected() {
         // Review M2: 0 browsers means there is nothing to compare
         // against; the check must surface `N/A`, not a false-positive
@@ -795,7 +1304,8 @@ mod m2_tests {
                 session_count: 0,
                 connected_at_ms: 1,
                 version_skew: false,
-                extension_protocol_version: "1.0".into(),
+                extension_protocol_version: "2.0".into(),
+                unresponsive: false,
             }],
             Vec::new(),
         );
@@ -816,7 +1326,8 @@ mod m2_tests {
                 session_count: 0,
                 connected_at_ms: 1,
                 version_skew: true,
-                extension_protocol_version: "1.1".into(),
+                extension_protocol_version: "2.1".into(),
+                unresponsive: false,
             }],
             vec![VersionSkewEntry {
                 instance_id: "alpha".into(),
@@ -824,8 +1335,8 @@ mod m2_tests {
                 label: "Personal".into(),
                 server_version: env!("CARGO_PKG_VERSION").into(),
                 client_version: "0.0.9".into(),
-                server_protocol_version: "1.0".into(),
-                client_protocol_version: "1.1".into(),
+                server_protocol_version: "2.0".into(),
+                client_protocol_version: "2.1".into(),
             }],
         );
         let check = check_browsers_protocol_compatible(Some(&status));
@@ -855,6 +1366,7 @@ mod m2_tests {
                 connected_at_ms: 1,
                 version_skew: true,
                 extension_protocol_version: String::new(),
+                unresponsive: false,
             }],
             vec![VersionSkewEntry {
                 instance_id: "legacy".into(),

@@ -313,7 +313,10 @@ fn success(output: Output) {
     );
 }
 
-fn refused(output: Output) {
+const JOB_FORBIDS_BREAKAWAY: &str = "does not allow breakaway";
+const PARTIAL_BREAKAWAY: &str = "still belongs to a Job Object after breakaway";
+
+fn refused(output: Output, diagnosis: &str) {
     assert!(!output.status.success());
     let text = format!(
         "{}{}",
@@ -323,6 +326,12 @@ fn refused(output: Output) {
     assert!(text.contains("Job Object"), "{text}");
     assert!(text.contains("persistent host task"), "{text}");
     assert!(text.contains("BSK_AUTO_START=0"), "{text}");
+    assert!(text.contains(diagnosis), "{text}");
+    for other in [JOB_FORBIDS_BREAKAWAY, PARTIAL_BREAKAWAY] {
+        if other != diagnosis {
+            assert!(!text.contains(other), "{text}");
+        }
+    }
 }
 
 // Re-exec the test binary as a gated launcher so assignment to a Job happens
@@ -398,7 +407,7 @@ fn restrictive_job_refuses_explicit_and_automatic_start_without_a_daemon() {
     ] {
         let fixture = Fixture::new();
         let job = Job::new(0);
-        refused(fixture.run(&args, &[&job]));
+        refused(fixture.run(&args, &[&job]), JOB_FORBIDS_BREAKAWAY);
         fixture.assert_stopped();
         job.assert_empty();
     }
@@ -412,7 +421,7 @@ fn nested_jobs_require_breakaway_from_every_level() {
         let inner = Job::new(JOB_OBJECT_LIMIT_BREAKAWAY_OK);
         let output = fixture.run(&["daemon", "start", "--port", "0"], &[&outer, &inner]);
         if outer_flags == 0 {
-            refused(output);
+            refused(output, PARTIAL_BREAKAWAY);
             fixture.assert_stopped();
             inner.assert_empty();
             outer.assert_empty();
@@ -462,6 +471,41 @@ fn foreground_stays_owned_by_the_host_job() {
 }
 
 #[test]
+fn foreground_in_a_persistent_job_survives_client_job_cleanup() {
+    let mut fixture = Fixture::new();
+    fixture.auto_start = false;
+    let owner = Job::new(0);
+    let mut launcher = fixture.launch(
+        &["daemon", "start", "--foreground", "--port", "0"],
+        &[&owner],
+    );
+    let original = fixture.wait_for_info();
+    let process = open_process(original.pid);
+    assert!(original.host_managed);
+    assert!(in_job(process.as_raw_handle(), owner.0.as_raw_handle()));
+
+    for _ in 0..2 {
+        let client_job = Job::new(0);
+        success(fixture.run(&["status", "--json"], &[&client_job]));
+        assert!(!in_job(
+            process.as_raw_handle(),
+            client_job.0.as_raw_handle()
+        ));
+        drop(client_job);
+        assert_alive(&process);
+        success(fixture.run(&["status", "--json"], &[]));
+        assert_eq!(fixture.info(), original);
+    }
+
+    drop(owner);
+    assert_eq!(
+        unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
+        WAIT_OBJECT_0
+    );
+    let _ = launcher.finish();
+}
+
+#[test]
 fn failed_start_is_bounded_and_releases_the_daemon_lock() {
     let fixture = Fixture::new();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -496,7 +540,7 @@ fn concurrent_starters_share_a_single_ready_daemon() {
 fn automatic_start_returns_eof_and_reuses_the_same_daemon() {
     // Auto-start intentionally uses the production default port. Never stop an
     // unrelated developer daemon to free it; CI must supply a free port.
-    match TcpListener::bind("127.0.0.1:52800") {
+    match TcpListener::bind(("127.0.0.1", bsk_protocol::DEFAULT_DAEMON_PORT)) {
         Ok(listener) => drop(listener),
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
             assert!(

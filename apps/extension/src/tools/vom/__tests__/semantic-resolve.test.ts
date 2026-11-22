@@ -1,0 +1,305 @@
+import { describe, expect, it, vi } from "vitest";
+import { toFrameDocumentHandle } from "@/browser-driver/frame-handles";
+import type { CapturedNode } from "../capture";
+import { buildSemanticGraph, resolveSemanticGraph, type SemanticAxNode } from "../semantic-graph";
+
+function dom(id: number, tag: string, textContent?: string): CapturedNode {
+  return {
+    backendNodeId: id,
+    parentBackendNodeId: id === 1 ? null : 1,
+    tag,
+    attrs: {},
+    textContent,
+    rect: { x: 0, y: 0, w: 100, h: 20 },
+    paintOrder: id,
+    position: "static",
+    pointerEvents: "auto",
+  };
+}
+
+function graph(domNodes: CapturedNode[], axNodes: SemanticAxNode[] = []) {
+  return buildSemanticGraph({
+    viewport: { width: 800, height: 600 },
+    rootFrameId: "main",
+    documents: [
+      {
+        frameId: "main",
+        loaderId: "",
+        processKey: "root",
+        isOutOfProcess: false,
+        contextScopeId: "main",
+        handle: toFrameDocumentHandle(1, { frameId: "main" }),
+        domNodes,
+        axNodes,
+      },
+    ],
+  });
+}
+
+function byBackend(resolved: ReturnType<typeof resolveSemanticGraph>, id: number) {
+  return [...resolved.nodes.values()].find((node) => node.backendNodeId === id)?.vom;
+}
+
+describe("semantic sibling context", () => {
+  it.each(
+    [512, 2048].flatMap((count) => [false, true].map((ax) => ({ count, ax }))),
+  )("bounds sibling searches linearly for $count nodes (AX: $ax)", ({ count, ax }) => {
+    const domNodes = [
+      dom(1, "section"),
+      ...Array.from({ length: count }, (_, i) =>
+        dom(i + 2, i % 4 === 3 ? "input" : "div", i % 4 === 3 ? undefined : `Row ${i}`),
+      ),
+    ];
+    const axNodes: SemanticAxNode[] = ax
+      ? [
+          {
+            nodeId: "root",
+            backendDOMNodeId: 1,
+            childIds: domNodes
+              .slice(1)
+              .map((node) => String(node.backendNodeId))
+              .reverse(),
+          },
+          ...domNodes.slice(1).map((node) => ({
+            nodeId: String(node.backendNodeId),
+            parentId: "root",
+            backendDOMNodeId: node.backendNodeId,
+            role: { type: "role", value: node.tag === "input" ? "textbox" : "StaticText" },
+            ...(node.textContent
+              ? { name: { type: "computedString", value: node.textContent } }
+              : {}),
+          })),
+        ]
+      : [];
+    const input = graph(domNodes, axNodes);
+    const original = Array.prototype.indexOf;
+    let searchedSlots = 0;
+    const search = vi.spyOn(Array.prototype, "indexOf").mockImplementation(function (
+      this: unknown[],
+      value: unknown,
+      fromIndex?: number,
+    ) {
+      searchedSlots += this.length;
+      return original.call(this, value, fromIndex);
+    });
+    let resolved: ReturnType<typeof resolveSemanticGraph>;
+    try {
+      resolved = resolveSemanticGraph(input);
+    } finally {
+      search.mockRestore();
+    }
+    expect(searchedSlots).toBeLessThanOrEqual(count * 16);
+    expect(resolved.nodes.size).toBe(count + 1);
+    expect(byBackend(resolved, 5)?.name).toBe(ax ? "Row 4" : "Row 2");
+    expect(byBackend(resolved, 2)?.nearbyText).toBe("Row 1 Row 2");
+  });
+
+  it("uses AX child order for preceding labels and DOM order for nearby text", () => {
+    const resolved = resolveSemanticGraph(
+      graph(
+        [dom(1, "section"), dom(2, "div", "DOM first"), dom(3, "input"), dom(4, "div", "DOM last")],
+        [
+          { nodeId: "root", backendDOMNodeId: 1, childIds: ["label", "field", "tail"] },
+          {
+            nodeId: "field",
+            parentId: "root",
+            backendDOMNodeId: 3,
+            role: { type: "role", value: "textbox" },
+          },
+          {
+            nodeId: "tail",
+            parentId: "root",
+            backendDOMNodeId: 2,
+            role: { type: "role", value: "StaticText" },
+            name: { type: "computedString", value: "AX tail" },
+          },
+          {
+            nodeId: "label",
+            parentId: "root",
+            backendDOMNodeId: 4,
+            role: { type: "role", value: "StaticText" },
+            name: { type: "computedString", value: "AX label" },
+          },
+        ],
+      ),
+    );
+    expect(byBackend(resolved, 3)).toMatchObject({
+      name: "AX label",
+      nearbyText: "DOM first DOM last",
+    });
+  });
+
+  it("extracts up to 10 native <select> options penetrating <optgroup> and omits them on sensitive selects", () => {
+    const optionNodes: CapturedNode[] = Array.from({ length: 11 }, (_, idx) => ({
+      ...dom(10 + idx, "option", `大区 ${idx + 1}`),
+      parentBackendNodeId: idx < 5 ? 3 : 4,
+      attrs: { value: `reg_${idx + 1}` },
+      ...(idx === 1 ? { checked: true } : { checked: false }),
+    }));
+    const resolved = resolveSemanticGraph(
+      graph([
+        dom(1, "form"),
+        { ...dom(2, "select"), parentBackendNodeId: 1, formValue: "reg_2" },
+        { ...dom(3, "optgroup"), parentBackendNodeId: 2, attrs: { label: "南方" } },
+        { ...dom(4, "optgroup"), parentBackendNodeId: 2, attrs: { label: "北方" } },
+        ...optionNodes,
+        {
+          ...dom(30, "select"),
+          parentBackendNodeId: 1,
+          attrs: { autocomplete: "cc-exp-month" },
+        },
+        { ...dom(31, "option", "01"), parentBackendNodeId: 30, attrs: { value: "01" } },
+      ]),
+    );
+    const selectVom = byBackend(resolved, 2);
+    expect(selectVom?.selectOptions).toHaveLength(10);
+    expect(selectVom?.selectOptionsTruncated).toBe(true);
+    expect(selectVom?.selectOptions?.[1]).toEqual({
+      value: "reg_2",
+      label: "大区 2",
+      selected: true,
+    });
+    expect(byBackend(resolved, 30)?.selectOptions).toBeUndefined();
+  });
+
+  it("computes distinguishing rowAnchor for table rows and virtual-row pools while ignoring timers and form rows", () => {
+    const vrows: CapturedNode[] = [];
+    for (let slot = 0; slot < 6; slot++) {
+      const rowId = 100 + slot * 10;
+      vrows.push(
+        { ...dom(rowId, "div"), parentBackendNodeId: 50, attrs: { class: "vrow" } },
+        {
+          ...dom(rowId + 1, "span", `TK-100${slot} | P1 | 网关续期`),
+          parentBackendNodeId: rowId,
+        },
+        { ...dom(rowId + 2, "button", "批准发布"), parentBackendNodeId: rowId },
+      );
+    }
+    const resolved = resolveSemanticGraph(
+      graph([
+        dom(1, "main"),
+        { ...dom(10, "table"), parentBackendNodeId: 1 },
+        { ...dom(11, "tr"), parentBackendNodeId: 10 },
+        { ...dom(12, "td", "00:15"), parentBackendNodeId: 11 },
+        { ...dom(13, "td", "ORD-8841"), parentBackendNodeId: 11 },
+        { ...dom(14, "td"), parentBackendNodeId: 11 },
+        { ...dom(15, "button", "退款"), parentBackendNodeId: 14 },
+        { ...dom(50, "div"), parentBackendNodeId: 1, attrs: { id: "pool" } },
+        ...vrows,
+      ]),
+    );
+    expect(byBackend(resolved, 15)?.rowAnchor).toBe("ORD-8841");
+    expect(byBackend(resolved, 102)?.rowAnchor).toBe("TK-1000 | P1 | 网关续期");
+  });
+
+  it("skips volatile progress percentages, stops at shadow boundaries, and keeps snapshot/in-page rowAnchor spec in parity", () => {
+    const resolved = resolveSemanticGraph(
+      graph([
+        dom(1, "main"),
+        { ...dom(10, "table"), parentBackendNodeId: 1 },
+        { ...dom(11, "tr"), parentBackendNodeId: 10 },
+        // Selection cell with empty checkbox wrapper (after comment-node stripping in snapshot.ts)
+        { ...dom(12, "td"), parentBackendNodeId: 11 },
+        { ...dom(13, "label"), parentBackendNodeId: 12, attrs: { class: "el-checkbox" } },
+        { ...dom(14, "span"), parentBackendNodeId: 13 },
+        // Volatile progress percentage cell ("45%") skipped in favor of stable filename
+        { ...dom(15, "td", "45%"), parentBackendNodeId: 11 },
+        { ...dom(16, "td", "settlement-2026Q4.csv"), parentBackendNodeId: 11 },
+        { ...dom(17, "td"), parentBackendNodeId: 11 },
+        { ...dom(18, "button", "导出"), parentBackendNodeId: 17 },
+        // Button inside a ShadowRoot (#document-fragment, nodeType=11) must NOT leak across host <tr>
+        { ...dom(20, "tr"), parentBackendNodeId: 10 },
+        { ...dom(21, "td", "HOST-ROW-99"), parentBackendNodeId: 20 },
+        { ...dom(22, "td"), parentBackendNodeId: 20 },
+        { ...dom(23, "x-widget"), parentBackendNodeId: 22 },
+        { ...dom(24, "#document-fragment"), parentBackendNodeId: 23, nodeType: 11 } as CapturedNode,
+        { ...dom(25, "button", "内部操作"), parentBackendNodeId: 24 },
+      ]),
+    );
+    expect(byBackend(resolved, 18)?.rowAnchor).toBe("settlement-2026Q4.csv");
+    expect(byBackend(resolved, 25)?.rowAnchor).toBeUndefined();
+  });
+
+  it("keeps popup state in structured hasPopup/expanded fields without mutating vom.name", () => {
+    const resolved = resolveSemanticGraph(
+      graph([
+        dom(1, "main"),
+        {
+          ...dom(10, "div", "Filter"),
+          attrs: { role: "combobox", "aria-haspopup": "listbox", "aria-expanded": "true" },
+        },
+        {
+          ...dom(11, "button", "More actions"),
+          attrs: { "aria-haspopup": "menu", "aria-expanded": "false" },
+        },
+      ]),
+    );
+    expect(byBackend(resolved, 10)).toMatchObject({
+      role: "combobox",
+      name: "Filter",
+      hasPopup: true,
+      expanded: true,
+    });
+    expect(byBackend(resolved, 11)).toMatchObject({
+      role: "button",
+      name: "More actions",
+      hasPopup: true,
+      expanded: false,
+    });
+  });
+
+  it("never derives a sensitive input's name from AX StaticText value and masks AX-only textboxes when requested", () => {
+    const resolvedSensitive = resolveSemanticGraph(
+      graph(
+        [
+          dom(1, "main"),
+          {
+            ...dom(10, "input"),
+            attrs: { type: "text", "data-bsk-record-password": "", placeholder: "Secret" },
+          },
+        ],
+        [
+          {
+            nodeId: "ax-10",
+            backendDOMNodeId: 10,
+            role: { type: "role", value: "textbox" },
+            value: { value: "PLAIN_SECRET_VALUE" },
+            childIds: ["ax-11"],
+          },
+          {
+            nodeId: "ax-11",
+            parentId: "ax-10",
+            role: { type: "role", value: "StaticText" },
+            name: { type: "computed", value: "PLAIN_SECRET_VALUE" },
+          },
+        ],
+      ),
+    );
+    const sensitiveNode = byBackend(resolvedSensitive, 10);
+    expect(sensitiveNode?.sensitive).toBe(true);
+    expect(sensitiveNode?.value).toBeUndefined();
+    expect(sensitiveNode?.name).toBe("Secret");
+    expect(JSON.stringify(sensitiveNode)).not.toContain("PLAIN_SECRET_VALUE");
+
+    const resolvedAxOnly = resolveSemanticGraph(
+      graph(
+        [],
+        [
+          {
+            nodeId: "ax-20",
+            backendDOMNodeId: 20,
+            role: { type: "role", value: "textbox" },
+            name: { type: "computed", value: "Password" },
+            value: { value: "AX_ONLY_SECRET" },
+          },
+        ],
+      ),
+      { redactUnverifiedAxValues: true },
+    );
+    const axOnlyNode = byBackend(resolvedAxOnly, 20);
+    expect(axOnlyNode?.sensitive).toBe(true);
+    expect(axOnlyNode?.value).toBeUndefined();
+    expect(axOnlyNode?.name).toBe("Password");
+    expect(JSON.stringify(axOnlyNode)).not.toContain("AX_ONLY_SECRET");
+  });
+});

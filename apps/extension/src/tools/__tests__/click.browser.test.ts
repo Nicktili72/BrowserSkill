@@ -1,12 +1,14 @@
 // @vitest-environment node
-// Opt in with BSK_CLICK_CHROME; each test owns its browser, profile and HTTP server.
+// Opt in with BSK_TEST_CHROME; each test owns its browser, profile and HTTP server.
+
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { i18n } from "@browser-skill/i18n";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
 import { describe, expect, it, vi } from "vitest";
-import { type CdpDebuggee, type CdpDebuggerApi, ChromiumCdp } from "@/browser-driver/chromium-cdp";
+import { type CdpDebuggerApi, ChromiumCdp } from "@/browser-driver/chromium-cdp";
 import { ControlOverlay } from "@/content/ControlOverlay";
 import {
   INPUT_PASSTHROUGH,
@@ -17,7 +19,7 @@ import { SessionManager } from "@/session-manager/manager";
 import { prepareBackgroundExecution } from "../background-execution";
 import { handleClick, handlePress } from "../interaction";
 import { handleObserve } from "../observation";
-import type { CdpRunner } from "../shared";
+import { type CdpRunner, createStubCdpRunner } from "../shared";
 import { handleWheel } from "../wheel";
 
 type Send = <T = Record<string, unknown>>(
@@ -32,9 +34,9 @@ interface CdpEvent {
   params?: object;
 }
 
-type CdpEventListener = (source: CdpDebuggee, method: string, params: unknown) => void;
+type CdpEventListener = Parameters<CdpDebuggerApi["onEvent"]["addListener"]>[0];
 
-describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", () => {
+describe.skipIf(!process.env.BSK_TEST_CHROME)("real browser click readiness", () => {
   it("delivers hidden native input, preserves disabled semantics and restores visibility", async () => {
     const server = createServer((_request, response) => {
       response.setHeader("Content-Type", "text/html");
@@ -54,7 +56,7 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
       let onEvent: ((event: CdpEvent) => void) | undefined;
       await withChrome(
         {
-          executable: process.env.BSK_CLICK_CHROME,
+          executable: process.env.BSK_TEST_CHROME,
           deviceScale: 1.5,
           zoom: 1,
           // A standalone CI job starts Chrome cold, before frontend work warms the runner.
@@ -120,13 +122,13 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
               hidden ? "hidden" : "visible",
             );
             const commands: { method: string; params?: object }[] = [];
-            const cdp: CdpRunner = {
+            const cdp: CdpRunner = createStubCdpRunner({
               send: async (_tabId, method, params) => {
                 commands.push({ method, params });
                 return (await send(method, params, target.sessionId)) as never;
               },
               getAttachmentId: () => target.sessionId,
-            };
+            });
             const tab = { id: 4, windowId: 100, active: !hidden } as chrome.tabs.Tab;
             const tabsApi = { get: async () => tab, query: async () => [tab] };
             let action: { ref?: string; selector?: string } = {
@@ -241,7 +243,7 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
             if (event.method === "DOM.documentUpdated") documentUpdates++;
             for (const listener of listeners) listener({ tabId: 4 }, event.method, event.params);
           };
-          const readinessCommands: { method: string; elapsedMs?: number; state: string }[] = [];
+          const cdpCommands: { method: string; elapsedMs?: number; state: string }[] = [];
           const api: CdpDebuggerApi = {
             // page() already attached the root debugger session.
             attach: async () => {},
@@ -250,7 +252,7 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
             },
             sendCommand: async (debuggee, method, params) => {
               const call = { method, state: "pending", elapsedMs: undefined as number | undefined };
-              readinessCommands.push(call);
+              cdpCommands.push(call);
               const started = performance.now();
               try {
                 const result = await send(method, params, debuggee.sessionId ?? target.sessionId);
@@ -314,19 +316,54 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
             expect(ref).toBeDefined();
             expect(documentChanges).toBe(0);
             expect(await prepare("tool.click")).toBeUndefined();
-            readinessCommands.length = 0;
+            expect(cdp.ownsBackgroundExecution(ctx.sessionId, 4)).toBe(true);
+            cdpCommands.length = 0;
             const clicked = await handleClick(
               manager,
               { session_id: ctx.sessionId, tab_id: 4, ref: ref! },
               { cdp, tabsApi },
             );
-            expect(
-              clicked,
-              JSON.stringify({ clicked, commands: readinessCommands }),
-            ).not.toHaveProperty("code");
+            expect(clicked, JSON.stringify({ clicked, commands: cdpCommands })).not.toHaveProperty(
+              "code",
+            );
             expect(await target.evaluate("window.clicks")).toEqual([true]);
+            expect(
+              cdpCommands.some(
+                (command) =>
+                  command.method === "Emulation.setFocusEmulationEnabled" ||
+                  command.method === "Page.captureScreenshot",
+              ),
+            ).toBe(false);
             expect(documentChanges).toBe(0);
             expect(ctx.refStore.resolve(ref!, { tabId: 4 })).not.toBeNull();
+
+            // Drop the override on the same debugger session, bypassing the applied-state
+            // cache as a service-worker command would. The lease owner must restore it.
+            await send("Emulation.setFocusEmulationEnabled", { enabled: false }, target.sessionId);
+            expect(await target.evaluate("document.visibilityState")).toBe("hidden");
+            expect(await prepare("tool.click")).toBeUndefined();
+            cdpCommands.length = 0;
+            const recovered = await handleClick(
+              manager,
+              { session_id: ctx.sessionId, tab_id: 4, ref: ref! },
+              { cdp, tabsApi },
+            );
+            expect(
+              recovered,
+              JSON.stringify({ recovered, commands: cdpCommands }),
+            ).not.toHaveProperty("code");
+            expect(await target.evaluate("window.clicks")).toEqual([true, true]);
+            expect(
+              cdpCommands.filter(
+                (command) => command.method === "Emulation.setFocusEmulationEnabled",
+              ),
+            ).toHaveLength(1);
+            expect(cdpCommands.some((command) => command.method === "Page.captureScreenshot")).toBe(
+              false,
+            );
+            expect(await target.evaluate("document.visibilityState")).toBe("visible");
+            expect(cdp.ownsBackgroundExecution(ctx.sessionId, 4)).toBe(true);
+            expect(await foreground.evaluate("document.visibilityState")).toBe("visible");
             await cdp.send(4, "Page.navigate", { url: `${url}/next` });
             await vi.waitFor(() => expect(documentUpdates).toBeGreaterThan(0), { timeout: 5000 });
             expect(documentChanges).toBeGreaterThan(0);
@@ -344,6 +381,7 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
               flatten: true,
             });
             await cdp.detachSession(ctx.sessionId);
+            expect(cdp.ownsBackgroundExecution(ctx.sessionId, 4)).toBe(false);
             const focus = await send<{ result: { value: boolean } }>(
               "Runtime.evaluate",
               { expression: "document.hasFocus()", returnByValue: true },
@@ -364,6 +402,107 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   }, 90_000);
+
+  it("keeps Stop fully visible and clickable in short control cards", async () => {
+    const { withChrome } = await import(
+      new URL(
+        "../../../../../evals/browser/cases/regression/snapshot-coordinates/chrome.mjs",
+        import.meta.url,
+      ).href
+    );
+    const css = readFileSync(new URL("../../content/overlay.css", import.meta.url), "utf8");
+    const language = i18n.language;
+    try {
+      await withChrome(
+        { executable: process.env.BSK_TEST_CHROME, deviceScale: 1, zoom: 1 },
+        async (send: Send) => {
+          const { targetId } = await send<{ targetId: string }>("Target.createTarget", {
+            url: "about:blank",
+          });
+          const { sessionId } = await send<{ sessionId: string }>("Target.attachToTarget", {
+            targetId,
+            flatten: true,
+          });
+          const local: Send = (method, params) => send(method, params, sessionId);
+          const evaluate = async <T>(expression: string) => {
+            const reply = await local<{ result: { value: T }; exceptionDetails?: unknown }>(
+              "Runtime.evaluate",
+              { expression, returnByValue: true },
+            );
+            expect(reply.exceptionDetails).toBeUndefined();
+            return reply.result.value;
+          };
+          await local("Page.bringToFront");
+          await evaluate(`window.overlay=document.createElement('browser-skill-overlay');
+            document.documentElement.append(overlay);
+            window.overlayRoot=overlay.attachShadow({mode:'closed'});`);
+          for (const locale of ["zh-CN", "de-DE"]) {
+            await i18n.changeLanguage(locale);
+            for (const [width, height, coarse] of [
+              [600, 140, false],
+              [600, 160, false],
+              [320, 120, true],
+              [320, 140, true],
+              [1280, 800, false],
+            ] as const) {
+              await local("Emulation.setDeviceMetricsOverride", {
+                width,
+                height,
+                deviceScaleFactor: 1,
+                mobile: false,
+              });
+              await local("Emulation.setTouchEmulationEnabled", { enabled: coarse });
+              expect(await evaluate("matchMedia('(pointer: coarse)').matches")).toBe(coarse);
+              for (const cooperative of [false, true]) {
+                const scenario = `${locale} ${width}x${height} ${cooperative ? "cooperative" : "fallback"}`;
+                const markup = renderToStaticMarkup(
+                  createElement(ControlOverlay, {
+                    visible: true,
+                    state: cooperative ? { mode: "human", editing: true, revision: 1 } : undefined,
+                    interrupting: false,
+                    automationBypass: false,
+                    onInterrupt: () => {},
+                  }),
+                );
+                await evaluate(`overlay.toggleAttribute('data-bsk-overlay-surface',${!cooperative});
+                  overlay.toggleAttribute('data-bsk-overlay-blocking',${!cooperative});
+                  overlayRoot.innerHTML=${JSON.stringify(`<style>${css}</style>`)}+${JSON.stringify(markup)};
+                  window.stops=[];
+                  overlayRoot.querySelector('[data-slot="control-overlay-stop-all"]').addEventListener('click',e=>stops.push(e.isTrusted));`);
+                const target = await evaluate<{
+                  visible: boolean;
+                  hit: boolean;
+                  x: number;
+                  y: number;
+                }>(`(() => {
+                  const stop=overlayRoot.querySelector('[data-slot="control-overlay-stop-all"]');
+                  const r=stop.getBoundingClientRect(), card=stop.closest('[role="toolbar"]').getBoundingClientRect();
+                  const x=r.x+r.width/2, y=r.y+r.height/2;
+                  return {x,y,
+                    visible:r.width>0 && r.height>0 && r.left>=Math.max(0,card.left) && r.top>=Math.max(0,card.top) && r.right<=Math.min(innerWidth,card.right) && r.bottom<=Math.min(innerHeight,card.bottom),
+                    hit:stop.contains(overlayRoot.elementFromPoint(x,y))};
+                })()`);
+                expect(target.visible, scenario).toBe(true);
+                expect(target.hit, scenario).toBe(true);
+                for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+                  await local("Input.dispatchMouseEvent", {
+                    type,
+                    x: target.x,
+                    y: target.y,
+                    button: "left",
+                    clickCount: 1,
+                  });
+                }
+                expect(await evaluate("stops"), scenario).toEqual([true]);
+              }
+            }
+          }
+        },
+      );
+    } finally {
+      await i18n.changeLanguage(language);
+    }
+  }, 30_000);
 
   it("preserves hover and visible controls while scoped passthrough clears closed shadow click targets", async () => {
     const { withChrome } = await import(
@@ -390,7 +529,7 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
       ),
     );
     await withChrome(
-      { executable: process.env.BSK_CLICK_CHROME, deviceScale: 1, zoom: 1, startupTimeout: 30_000 },
+      { executable: process.env.BSK_TEST_CHROME, deviceScale: 1, zoom: 1, startupTimeout: 30_000 },
       async (send: Send) => {
         const { targetId } = await send<{ targetId: string }>("Target.createTarget", {
           url: "about:blank",
@@ -439,21 +578,21 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
         const tab = { id: 4, windowId: 100, active: true } as chrome.tabs.Tab;
         const tabsApi = { get: async () => tab, query: async () => [tab] };
         const mouse: string[] = [];
-        const cdp: CdpRunner = {
+        const cdp: CdpRunner = createStubCdpRunner({
           send: async (_tabId, method, params) => {
             if (method === "Input.dispatchMouseEvent") {
               mouse.push((params as { type: string }).type);
               expect(await evaluate("getComputedStyle(overlay).display")).toBe("block");
               expect(
                 await evaluate(
-                  "getComputedStyle(overlayRoot.querySelector('[data-slot=control-overlay-pill]')).opacity",
+                  "getComputedStyle(overlayRoot.querySelector('[role=toolbar]')).opacity",
                 ),
               ).toBe("1");
               expect(await evaluate("overlay.hasAttribute('data-bsk-capture-hidden')")).toBe(false);
             }
             return (await local(method, params)) as never;
           },
-        };
+        });
         const phases: string[] = [];
         const sendInputPassthrough: InputPassthroughSendToTab = async (_tabId, message) => {
           phases.push(message.phase);
@@ -462,24 +601,26 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
           );
         };
         const bypassOverlay = async (_tabId: number, enabled: boolean) => {
-          await evaluate(`window.bypassCount += ${enabled ? 1 : -1};
+          await evaluate(`(() => { window.bypassCount += ${enabled ? 1 : -1};
             overlay.toggleAttribute('data-bsk-overlay-blocking',bypassCount===0);
-            overlayRoot.querySelector('[data-slot="control-overlay-blocker"]').style.pointerEvents=bypassCount>0?'none':'auto';`);
+            const blocker=overlayRoot.querySelector('[data-slot="control-overlay-blocker"]'); if(blocker) blocker.style.pointerEvents=bypassCount>0?'none':'auto'; })()`);
         };
-        // A retained hover bypass leaves the pill interactive even though the host is transparent.
-        for (const automationBypass of [false, true]) {
+        // A retained hover bypass leaves the card interactive even though the host is transparent.
+        for (const mode of ["blocking", "bypass", "cooperation"] as const) {
+          const automationBypass = mode === "bypass";
+          const cardSlot = mode === "cooperation" ? "cooperation-toolbar" : "control-overlay-card";
           const markup = renderToStaticMarkup(
             createElement(ControlOverlay, {
               visible: true,
               interrupting: false,
               automationBypass,
+              state:
+                mode === "cooperation" ? { mode: "ready", revision: 1, editing: false } : undefined,
               onInterrupt: () => {},
             }),
           );
-          await evaluate(`window.bypassCount=${automationBypass ? 1 : 0}; overlay.toggleAttribute('data-bsk-overlay-blocking', ${!automationBypass});
+          await evaluate(`window.bypassCount=${automationBypass ? 1 : 0}; overlay.toggleAttribute('data-bsk-overlay-blocking', ${mode === "blocking"});
             overlayRoot.innerHTML = ${JSON.stringify(`<style>${css}</style>`)} + ${JSON.stringify(markup)};
-            // Static markup starts before the component's reveal effect; model its settled state.
-            for (const control of overlayRoot.querySelectorAll('[data-slot^="control-overlay"]')) control.style.opacity='1';
             overlayRoot.querySelector('[data-slot="control-overlay-stop-all"]').addEventListener('click',()=>stops++);`);
           await evaluate(
             "Object.assign(document.querySelector('#target').style,{left:'20px',top:'20px'})",
@@ -493,10 +634,10 @@ describe.skipIf(!process.env.BSK_CLICK_CHROME)("real browser click readiness", (
           expect(clear).not.toHaveProperty("code");
           expect(phases).toEqual([]);
           expect(await evaluate("bypassCount")).toBe(automationBypass ? 1 : 0);
-          for (const slot of ["control-overlay-pill", "control-overlay-stop-all"]) {
+          for (const slot of [cardSlot, "control-overlay-stop-all"]) {
             const point = await evaluate<{ x: number; y: number }>(`(() => {
               const r=overlayRoot.querySelector('[data-slot="${slot}"]').getBoundingClientRect();
-              const x=${slot === "control-overlay-pill" ? "r.x+25" : "r.x+r.width/2"}, y=r.y+r.height/2;
+              const x=${slot === cardSlot ? "r.x+25" : "r.x+r.width/2"}, y=r.y+r.height/2;
               Object.assign(document.querySelector('#target').style,{left:(x-40)+'px',top:(y-15)+'px'});
               clicks=[]; stops=0; return {x,y};
             })()`);

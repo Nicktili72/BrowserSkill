@@ -10,7 +10,9 @@ import type { SessionManager } from "@/session-manager/manager";
 import type { RpcError, UploadParams, UploadResult } from "@/transport/types";
 import { uploadThroughFileDrop } from "./file-drop-transaction";
 import { uploadThroughActivatedFileInput } from "./file-input-transaction";
+import { withInputReady } from "./input-readiness";
 import { clickResolvedTarget, type InteractionDeps, resolveActionTarget } from "./interaction";
+import { pointerTransactionDeps } from "./pointer-transaction";
 import {
   type CdpRunner,
   enforceAgentWindow,
@@ -47,34 +49,62 @@ export async function handleUpload(
   const address = await resolveActionTarget(deps.cdp, ctx, target, params, "upload");
   if (isRpcError(address)) return address;
   const timeoutMs = params.timeout_ms ?? DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   const files = params.files.map((file) => file.staged_path as string);
   const mode = params.mode ?? "input";
   let usedRef = address.usedRef;
   let usedSelector = address.usedSelector;
   if (mode === "drop") {
     deps.cdp.trackSessionTab?.(ctx.sessionId, target.tabId);
-    const transaction = await uploadThroughFileDrop({
-      cdp: deps.cdp,
-      actionTarget: address,
-      files,
-      timeoutMs,
-      signal: deps.signal,
-      withOverlayHidden: (operation) =>
-        withExtensionOverlayHidden(target.tabId, operation, deps.sendToTab),
-    });
+    const transaction = await withInputReady(
+      ctx,
+      target.tabId,
+      {
+        ...deps,
+        deadline,
+        preserveWindowFocus: true,
+      },
+      (input) =>
+        uploadThroughFileDrop({
+          cdp: deps.cdp,
+          actionTarget: address,
+          files,
+          timeoutMs: Math.max(1, deadline - Date.now()),
+          signal: deps.signal,
+          onDropSent: input.markSent,
+          withOverlayHidden: (operation) =>
+            withExtensionOverlayHidden(target.tabId, operation, deps.sendToTab),
+        }),
+    );
     if (isRpcError(transaction)) return transaction;
   } else {
+    const trigger = pointerTransactionDeps(deps, deps.signal);
     const transaction = await uploadThroughActivatedFileInput({
       cdp: deps.cdp,
       actionTarget: address,
       files,
       timeoutMs,
       signal: deps.signal,
-      trigger: () => clickResolvedTarget(ctx, address, {}, deps),
+      trigger: () =>
+        withInputReady(
+          ctx,
+          target.tabId,
+          {
+            cdp: deps.cdp,
+            signal: deps.signal,
+            deadline,
+            preserveWindowFocus: true,
+            registerCleanup: trigger.deps.registerClickCleanup,
+          },
+          (input) => clickResolvedTarget(ctx, address, {}, trigger.deps, input.markSent),
+        ),
+      cleanupTrigger: (deadline) => trigger.cleanup(deadline),
     });
     if (isRpcError(transaction)) return transaction;
-    usedRef = transaction.click.used_ref;
-    usedSelector = transaction.click.used_selector;
+    if (transaction.click) {
+      usedRef = transaction.click.used_ref;
+      usedSelector = transaction.click.used_selector;
+    }
   }
   return {
     tab_id: target.tabId,

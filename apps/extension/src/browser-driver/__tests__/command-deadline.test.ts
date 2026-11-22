@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { createStubCdpRunner } from "@/tools/shared";
 import { isAbortError, isCaptureTerminalError } from "@/tools/vom/capture-abort";
 import { captureObservationFacts } from "@/tools/vom/capture-coordinator";
 import {
@@ -25,13 +26,14 @@ it("times out stuck snapshots with the actual method and stops fallback reads", 
       method === "DOMSnapshot.captureSnapshot" ? new Promise<never>(() => {}) : Promise.resolve({}),
     ),
   );
-  const work = captureObservationFacts({ send: send as never }, 4);
+  const work = captureObservationFacts(createStubCdpRunner({ send: send as never }), 4);
   const checked = expect(work).rejects.toThrow(
     "DOMSnapshot.captureSnapshot timed out after 20000ms (tab 4)",
   );
   await vi.advanceTimersByTimeAsync(CAPTURE_READ_TIMEOUT_MS);
   await checked;
   expect(send.mock.calls.map((call) => call[1])).toEqual([
+    "Page.getFrameTree",
     "DOMSnapshot.enable",
     "DOMSnapshot.captureSnapshot",
   ]);
@@ -40,12 +42,12 @@ it("times out stuck snapshots with the actual method and stops fallback reads", 
 
 it("does not start a snapshot after the frame graph read timed out", async () => {
   const send = vi.fn(async () => ({}));
-  const getFrameGraph = vi.fn(async () => {
+  const getFrameDocuments = vi.fn(async () => {
     throw new CdpReadTimeoutError("DOM.getFrameOwner", 4, READ_TIMEOUT_MS);
   });
-  await expect(captureObservationFacts({ send, getFrameGraph } as never, 4)).rejects.toThrow(
-    "DOM.getFrameOwner timed out",
-  );
+  await expect(
+    captureObservationFacts(createStubCdpRunner({ send: send as never, getFrameDocuments }), 4),
+  ).rejects.toThrow("DOM.getFrameOwner timed out");
   expect(send).not.toHaveBeenCalled();
 });
 
@@ -267,4 +269,22 @@ it("distinguishes browser deadlines from refused reads and describes actual reco
   expect(blocked.message).not.toContain("running in the renderer");
   expect(blocked.message).toContain("Navigation alone does not clear the read gate");
   expect(blocked.message).toContain("command settles or its debugger session detaches");
+});
+
+it("refuses the Accessibility cleanup only behind its own session's pending read", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  const gate = new CdpReadGate();
+  const child = { tabId: 4, sessionId: "child" };
+  const stuck = gate.run(child, "Accessibility.getFullAXTree", () => new Promise<never>(() => {}));
+  const stuckRejected = expect(stuck).rejects.toBeInstanceOf(CdpReadTimeoutError);
+  await vi.advanceTimersByTimeAsync(CAPTURE_READ_TIMEOUT_MS);
+  await stuckRejected;
+  const send = vi.fn(async () => ({}));
+  await expect(gate.run(child, "Accessibility.disable", send)).rejects.toMatchObject({
+    phase: "blocked",
+  });
+  expect(send).not.toHaveBeenCalled();
+  await gate.run({ tabId: 4 }, "Accessibility.disable", send);
+  expect(send).toHaveBeenCalledTimes(1);
 });

@@ -1,0 +1,536 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { SessionContext } from "@/session-manager/manager";
+import { resolveActionTarget } from "@/tools/interaction";
+import type { CdpRunner } from "@/tools/shared";
+import {
+  type ActionExpectation,
+  checkActionTarget,
+  checkExpectations,
+  parseExpectations,
+} from "./action-checks";
+
+vi.mock("@/tools/interaction", () => ({ resolveActionTarget: vi.fn() }));
+const tab = { tabId: 7, windowId: 100, active: true };
+const target = {
+  tab,
+  backendNodeId: 4,
+  frameId: "child",
+  handle: { tabId: 7, frameId: "child", loaderId: "child-loader", backendNodeId: 4 },
+  usedRef: "e1",
+};
+const session = {} as SessionContext;
+
+function fixture(html = '<button id="buy">Buy</button>') {
+  document.body.innerHTML = html;
+  const element = document.body.firstElementChild!;
+  vi.spyOn(element, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+  const sendToFrame = vi.fn(async (_handle, method, params) => {
+    if (method === "DOM.resolveNode") return { object: { objectId: "node" } };
+    if (method === "Runtime.callFunctionOn") {
+      const read = new Function(`return (${params.functionDeclaration})`)();
+      return {
+        result: {
+          value: read.apply(
+            element,
+            params.arguments.map((arg: { value: unknown }) => arg.value),
+          ),
+        },
+      };
+    }
+    return {};
+  });
+  const cdp = { send: vi.fn(), sendToFrame } as unknown as CdpRunner;
+  vi.mocked(resolveActionTarget).mockResolvedValue(target);
+  return { cdp, element, sendToFrame };
+}
+
+beforeEach(() => {
+  vi.restoreAllMocks();
+  vi.clearAllMocks();
+});
+
+describe("explicit action conditions", () => {
+  it.each([
+    null,
+    {},
+    [null],
+    [{ target: "#a", field: "value", equals: true }],
+    [{ target: "#a", field: "checked", equals: "true" }],
+    [{ target: "#a", field: "attribute", equals: "42" }],
+    [{ target: "#a", field: "attribute", attribute: "", equals: null }],
+    [{ target: "#a", field: "text", equals: "ok", attribute: "id" }],
+    [{ target: "#a", field: "text", equals: "ok", script: "submit()" }],
+    [{ target: " ", field: "exists", equals: false }],
+    Array.from({ length: 17 }, () => ({ target: "#a", field: "exists", equals: true })),
+  ])("rejects malformed conditions before inspecting the page: %j", (value) => {
+    expect(parseExpectations(value)).toMatchObject({
+      code: "invalid_params",
+      data: { reason: "precondition_invalid", effect_state: "none" },
+    });
+  });
+
+  it.each(["a", "中", "😀"])("counts %s as one character at condition length limits", (char) => {
+    const target = `#${char.repeat(1023)}`;
+    const attribute = `data-${char.repeat(251)}`;
+    const checks = [{ target, field: "attribute", attribute, equals: null }];
+    expect(parseExpectations(checks)).toBe(checks);
+    expect(parseExpectations([{ ...checks[0], target: target + char }])).toMatchObject({
+      code: "invalid_params",
+      data: { reason: "precondition_invalid", effect_state: "none" },
+    });
+    expect(parseExpectations([{ ...checks[0], attribute: attribute + char }])).toMatchObject({
+      code: "invalid_params",
+      data: { reason: "precondition_invalid", effect_state: "none" },
+    });
+  });
+
+  it("reports exact changed facts, releases its object group and checks the correct frame", async () => {
+    const f = fixture('<span id="price">$200</span>');
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "#price", field: "text", equals: "$100" },
+      ]),
+    ).toMatchObject({
+      code: "permission_denied",
+      data: {
+        reason: "precondition_failed",
+        phase: "precondition",
+        effect_state: "none",
+        target: "#price",
+        field: "text",
+        expected: "$100",
+        actual: "$200",
+      },
+    });
+    expect(resolveActionTarget).toHaveBeenCalledWith(
+      f.cdp,
+      session,
+      tab,
+      { selector: "#price" },
+      "precondition",
+      true,
+    );
+    expect(f.sendToFrame.mock.calls.every(([node]) => node.frameId === "child")).toBe(true);
+    expect(f.sendToFrame.mock.calls.at(-1)?.[1]).toBe("Runtime.releaseObjectGroup");
+  });
+
+  it("checks a virtualized row's explicit record identity even when the DOM node persists", async () => {
+    const f = fixture('<button data-record-id="B">Delete</button>');
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "attribute", attribute: "data-record-id", equals: "A" },
+      ]),
+    ).toMatchObject({
+      data: { field: "attribute", attribute: "data-record-id", expected: "A", actual: "B" },
+    });
+  });
+
+  it("keeps literal text exact and never evaluates expected values", async () => {
+    const f = fixture();
+    const literal = "${window.submit()} `quoted`\n trailing ";
+    f.element.textContent = literal;
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "text", equals: literal },
+      ]),
+    ).toBeUndefined();
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "text", equals: literal.trim() },
+      ]),
+    ).toMatchObject({ data: { actual: literal } });
+  });
+
+  it("reads live input properties, checked state and missing attributes", async () => {
+    const f = fixture('<input type="checkbox" value="old">');
+    const input = f.element as HTMLInputElement;
+    input.checked = true;
+    input.value = "new";
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "value", equals: "new" },
+        { target: "@e1", field: "checked", equals: true },
+        { target: "@e1", field: "attribute", attribute: "data-absent", equals: null },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it.each([
+    { html: '<button role="switch" aria-checked="true">Dark</button>', expected: true },
+    { html: '<button role="switch" aria-checked="false">Dark</button>', expected: false },
+    { html: '<div role="checkbox" aria-checked="true">Agree</div>', expected: true },
+    { html: '<div role="radio" aria-checked="true">Pro</div>', expected: true },
+  ])("checks ARIA checked state for $html", async ({ html, expected }) => {
+    const f = fixture(html);
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "checked", equals: expected },
+      ]),
+    ).toBeUndefined();
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "checked", equals: !expected },
+      ]),
+    ).toMatchObject({
+      code: "permission_denied",
+      data: { reason: "precondition_failed", expected: !expected, actual: expected },
+    });
+  });
+
+  it("does not treat aria-checked=mixed as true or false", async () => {
+    const f = fixture('<div role="checkbox" aria-checked="mixed">Select all</div>');
+    for (const expected of [true, false]) {
+      expect(
+        await checkExpectations(f.cdp, session, tab, [
+          { target: "@e1", field: "checked", equals: expected },
+        ]),
+      ).toMatchObject({
+        code: "permission_denied",
+        data: { reason: "precondition_failed", expected, actual: null },
+      });
+    }
+  });
+
+  it("strips excluded script/style/overlay descendants from expect(field: text) matching read", async () => {
+    const f = fixture(
+      '<div><script type="application/json">{"csrf":"tok"}</script><style>.x{color:red}</style><span>Order #42</span></div>',
+    );
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "text", equals: "Order #42" },
+      ]),
+    ).toBeUndefined();
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "text", equals: "Wrong" },
+      ]),
+    ).toMatchObject({
+      code: "permission_denied",
+      data: { reason: "precondition_failed", actual: "Order #42" },
+    });
+  });
+
+  it.each([
+    "detached",
+    "unresolved",
+  ])("does not interpret a %s precondition target as a missing attribute", async (kind) => {
+    const f = fixture();
+    if (kind === "detached") f.element.remove();
+    else f.sendToFrame.mockResolvedValueOnce({});
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "attribute", attribute: "data-pending", equals: null },
+      ]),
+    ).toMatchObject({
+      code: "permission_denied",
+      data: {
+        reason: "target_detached",
+        phase: "precondition",
+        effect_state: "none",
+        target: "@e1",
+      },
+    });
+    expect(f.sendToFrame.mock.calls.at(-1)?.[1]).toBe("Runtime.releaseObjectGroup");
+  });
+
+  it.each(["detached", "unresolved"])("allows exists:false for a %s node", async (kind) => {
+    const f = fixture();
+    if (kind === "detached") f.element.remove();
+    else f.sendToFrame.mockResolvedValueOnce({});
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e1", field: "exists", equals: false },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("distinguishes a missing selector from a stale ref or an ambiguous selector", async () => {
+    const f = fixture();
+    vi.mocked(resolveActionTarget).mockResolvedValueOnce({
+      code: "not_found",
+      message: "missing",
+      data: { reason: "selector_not_found" },
+    });
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "#removed", field: "exists", equals: false },
+      ]),
+    ).toBeUndefined();
+    vi.mocked(resolveActionTarget).mockResolvedValueOnce({
+      code: "not_found",
+      message: "stale",
+      data: { reason: "ref_not_found" },
+    });
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "@e100", field: "exists", equals: false },
+      ]),
+    ).toMatchObject({ data: { reason: "ref_not_found", phase: "precondition" } });
+    vi.mocked(resolveActionTarget).mockResolvedValueOnce({
+      code: "invalid_params",
+      message: "ambiguous",
+    });
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "button", field: "exists", equals: true },
+      ]),
+    ).toMatchObject({ code: "invalid_params" });
+  });
+
+  it("explains selector scope without searching other frames or losing the failure reason", async () => {
+    const f = fixture();
+    vi.mocked(resolveActionTarget).mockResolvedValueOnce({
+      code: "not_found",
+      message: "selector #price did not match any element",
+      data: { reason: "selector_not_found" },
+    });
+    expect(
+      await checkExpectations(f.cdp, session, tab, [
+        { target: "#price", field: "text", equals: "$100" },
+      ]),
+    ).toMatchObject({
+      code: "not_found",
+      message: expect.stringContaining("main document; use an observed ref for iframe elements"),
+      data: {
+        reason: "selector_not_found",
+        phase: "precondition",
+        effect_state: "none",
+        target: "#price",
+      },
+    });
+    expect(resolveActionTarget).toHaveBeenCalledOnce();
+    expect(f.sendToFrame).not.toHaveBeenCalled();
+  });
+});
+
+describe("target actionability", () => {
+  it.each<ActionExpectation>([
+    { target: "@e1", field: "value", equals: "old-value" },
+    ...["value", "VALUE", "Value"].map((attribute) => ({
+      target: "@e1",
+      field: "attribute" as const,
+      attribute,
+      equals: "old-value",
+    })),
+  ])("does not expose sensitive control values in condition failures: %j", async (check) => {
+    const f = fixture('<input type="password" value="private-value">');
+    const result = await checkExpectations(f.cdp, session, tab, [check]);
+    expect(result).toMatchObject({
+      data: { reason: "precondition_failed", redacted: true, expected: "•••", actual: "•••" },
+    });
+    expect(JSON.stringify(result)).not.toContain("private-value");
+    expect(JSON.stringify(result)).not.toContain("old-value");
+  });
+  it.each([
+    '<input autocomplete="one-time-code" value="private-value">',
+    '<input autocomplete="billing cc-number" value="private-value">',
+    '<input autocomplete="section-login Current-Password" value="private-value">',
+  ])("does not expose code or card values in condition failures: %s", async (html) => {
+    const f = fixture(html);
+    const result = await checkExpectations(f.cdp, session, tab, [
+      { target: "@e1", field: "value", equals: "old-value" },
+    ]);
+    expect(result).toMatchObject({ data: { reason: "precondition_failed", redacted: true } });
+    expect(JSON.stringify(result)).not.toContain("private-value");
+  });
+  it.each([
+    ["detached", "target_detached"],
+    ["hidden", "target_hidden"],
+    ["disabled", "target_disabled"],
+  ])("reports %s without examining neighbouring content", async (kind, reason) => {
+    const f = fixture();
+    if (kind === "detached") f.element.remove();
+    if (kind === "hidden") (f.element as HTMLElement).style.visibility = "hidden";
+    if (kind === "disabled") f.element.setAttribute("disabled", "");
+    expect(await checkActionTarget(f.cdp, target, "tool.click")).toMatchObject({
+      data: { reason, phase: "target", target: "@e1", effect_state: "none" },
+    });
+  });
+
+  it.each(["display:none", "visibility:hidden"])("allows blur on a %s target", async (style) => {
+    const f = fixture(`<input style="${style}">`);
+    if (style === "display:none")
+      vi.mocked(f.element.getClientRects).mockReturnValue([] as unknown as DOMRectList);
+    expect(await checkActionTarget(f.cdp, target, "tool.blur")).toBeUndefined();
+    f.element.remove();
+    expect(await checkActionTarget(f.cdp, target, "tool.blur")).toMatchObject({
+      data: { reason: "target_detached", phase: "target", effect_state: "none" },
+    });
+  });
+
+  it.each([
+    ["tool.fill", '<input style="display:none">'],
+    ["tool.select", '<select style="display:none"><option>One</option></select>'],
+    ["tool.download", '<a href="/file" style="display:none">Download</a>'],
+  ])("still rejects a hidden target for %s with actionable diagnostics", async (method, html) => {
+    const f = fixture(html);
+    vi.mocked(f.element.getClientRects).mockReturnValue([] as unknown as DOMRectList);
+    expect(await checkActionTarget(f.cdp, target, method)).toMatchObject({
+      code: "permission_denied",
+      message: "The action target is not visible",
+      data: {
+        reason: "target_hidden",
+        phase: "target",
+        effect_state: "none",
+        target: "@e1",
+        recovery: expect.stringContaining("Inspect or wait"),
+      },
+    });
+  });
+
+  it("still allows hovering a disabled control and rejects filling a readonly input", async () => {
+    let f = fixture("<button disabled>Help</button>");
+    expect(await checkActionTarget(f.cdp, target, "tool.hover")).toBeUndefined();
+    f = fixture('<input readonly value="locked">');
+    expect(await checkActionTarget(f.cdp, target, "tool.fill")).toMatchObject({
+      data: { reason: "target_readonly" },
+    });
+    expect(await checkActionTarget(f.cdp, target, "tool.focus")).toBeUndefined();
+  });
+});
+
+it.each([
+  "No node with given id found",
+  JSON.stringify({ code: -32000, message: "Could not find node with given id" }),
+])("classifies a collected node as detached without redirecting or entering input: %s", async (message) => {
+  const f = fixture();
+  f.sendToFrame.mockRejectedValueOnce(new Error(message));
+  expect(await checkActionTarget(f.cdp, target, "tool.click")).toMatchObject({
+    data: { reason: "target_detached", effect_state: "none", backend_node_id: 4 },
+  });
+  expect(f.sendToFrame.mock.calls.map((call) => call[1])).toEqual([
+    "DOM.resolveNode",
+    "Runtime.releaseObjectGroup",
+  ]);
+});
+it("keeps other CDP failures unavailable instead of declaring the node absent", async () => {
+  const f = fixture();
+  f.sendToFrame.mockRejectedValueOnce(new Error("Session disconnected"));
+  expect(await checkActionTarget(f.cdp, target, "tool.click")).toMatchObject({
+    data: { reason: "target_unavailable" },
+  });
+});
+
+describe("virtual-scroll row business-key guard", () => {
+  it("verifies rowAnchor in the single SAMPLE_TARGET call and blocks in-place DOM slot recycling with effect_state: none", async () => {
+    document.body.innerHTML = `
+      <div id="pool">
+        <div class="vrow" data-ticket-id="TK-1018"><span>TK-1018 | P1 | 高优-核心API网关证书续期</span><button id="slot0" type="button" aria-label="批准发布 TK-1018">批准发布</button></div>
+        <div class="vrow"><span>TK-1019 | P3 | 常规任务</span><button type="button">批准发布</button></div>
+        <div class="vrow"><span>TK-1020 | P3 | 常规任务</span><button type="button">批准发布</button></div>
+        <div class="vrow"><span>TK-1021 | P3 | 常规任务</span><button type="button">批准发布</button></div>
+      </div>
+    `;
+    const btn = document.getElementById("slot0")!;
+    vi.spyOn(btn, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    const sendToFrame = vi.fn(async (_target, method, params) => {
+      if (method === "DOM.resolveNode") return { object: { objectId: "slot0-obj" } };
+      if (method === "Runtime.callFunctionOn") {
+        const read = new Function(`return (${params.functionDeclaration})`)();
+        return {
+          result: {
+            value: read.apply(
+              btn,
+              params.arguments.map((arg: { value: unknown }) => arg.value),
+            ),
+          },
+        };
+      }
+      return {};
+    });
+    const cdp = { send: vi.fn(), sendToFrame } as unknown as CdpRunner;
+    const anchoredTarget = {
+      ...target,
+      usedRef: "e5",
+      rowAnchor: "TK-1018 | P1 | 高优-核心API网关证书续期",
+    };
+
+    // 1) Before virtual scroll recycling: passes with exactly 1 Runtime.callFunctionOn
+    expect(await checkActionTarget(cdp, anchoredTarget, "tool.click")).toBeUndefined();
+    expect(sendToFrame.mock.calls.filter(([, m]) => m === "Runtime.callFunctionOn")).toHaveLength(
+      1,
+    );
+
+    // 2) Virtual list recycles the exact same DOM row + button in place for TK-1017
+    sendToFrame.mockClear();
+    const row0 = btn.parentElement!;
+    row0.setAttribute("data-ticket-id", "TK-1017");
+    row0.querySelector("span")!.textContent = "TK-1017 | P3 | 常规变更任务-1017";
+    btn.setAttribute("aria-label", "批准发布 TK-1017");
+
+    const blocked = await checkActionTarget(cdp, anchoredTarget, "tool.click");
+    expect(blocked).toMatchObject({
+      code: "permission_denied",
+      data: {
+        reason: "virtual_row_recycled",
+        phase: "target",
+        effect_state: "none",
+        target: "@e5",
+        expected_row: "TK-1018 | P1 | 高优-核心API网关证书续期",
+        actual_row: "TK-1017 | P3 | 常规变更任务-1017",
+        recovery: expect.stringContaining("cooperate sync"),
+      },
+    });
+    // Zero extra CDP roundtrips: still a single Runtime.callFunctionOn!
+    expect(sendToFrame.mock.calls.map(([, m]) => m)).toEqual([
+      "DOM.resolveNode",
+      "Runtime.callFunctionOn",
+      "Runtime.releaseObjectGroup",
+    ]);
+  });
+
+  it("skips HTML comment nodes, 1x1 .sr-only microboxes, and volatile percentage cells in parity with snapshot resolution", async () => {
+    document.body.innerHTML = `
+      <table><tbody>
+        <tr>
+          <td><label class="el-checkbox"><span></span><!--v-if--></label></td>
+          <td><span id="sr" style="overflow:hidden">选择当前行</span></td>
+          <td id="pct">45%</td>
+          <td>ORD-902</td>
+          <td><button id="act" type="button">详情</button></td>
+        </tr>
+      </tbody></table>
+    `;
+    const sr = document.getElementById("sr")!;
+    vi.spyOn(sr, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      top: 0,
+      right: 1,
+      bottom: 1,
+      left: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+    const btn = document.getElementById("act")!;
+    vi.spyOn(btn, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    const sendToFrame = vi.fn(async (_target, method, params) => {
+      if (method === "DOM.resolveNode") return { object: { objectId: "act-obj" } };
+      if (method === "Runtime.callFunctionOn") {
+        const read = new Function(`return (${params.functionDeclaration})`)();
+        return {
+          result: {
+            value: read.apply(
+              btn,
+              params.arguments.map((arg: { value: unknown }) => arg.value),
+            ),
+          },
+        };
+      }
+      return {};
+    });
+    const cdp = { send: vi.fn(), sendToFrame } as unknown as CdpRunner;
+    const anchoredTarget = {
+      ...target,
+      usedRef: "e9",
+      rowAnchor: "ORD-902",
+    };
+
+    expect(await checkActionTarget(cdp, anchoredTarget, "tool.click")).toBeUndefined();
+
+    // Live progress cell ticks from 45% -> 88% on the same row: still resolves ORD-902 without false rejection
+    document.getElementById("pct")!.textContent = "88%";
+    expect(await checkActionTarget(cdp, anchoredTarget, "tool.click")).toBeUndefined();
+  });
+});

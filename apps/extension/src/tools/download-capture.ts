@@ -5,14 +5,16 @@
 // no CDP intent on the clicked target, so a navigation target that the clicked
 // tab opens after mouse press supplies the intent URL instead.
 
-import type { CdpTarget } from "@/browser-driver/frame-graph";
+import type { FrameDocumentGraph, FrameDocumentHandle } from "@/browser-driver/frame-handles";
 import type { ClickResult, RpcError, TransferEffectState } from "@/transport/types";
 import { transferError } from "./errors";
 import { type CdpRunner, isRpcError } from "./shared";
+import { waitBounded } from "./transfer-transaction";
 
 const CORRELATION_GRACE_MS = 750;
 const UNIQUE_SETTLE_MS = 50;
 const SIZE_POLL_MS = 250;
+const CLEANUP_TIMEOUT_MS = 1_000;
 
 type DeterminingFilenameListener = (
   item: chrome.downloads.DownloadItem,
@@ -62,7 +64,7 @@ export const chromeNavigationTargetsApi: NavigationTargetsApi = {
 
 export interface DownloadCaptureOptions {
   cdp: CdpRunner;
-  target: CdpTarget;
+  handle: FrameDocumentHandle;
   expectedFrameId?: string;
   downloads: DownloadsApi;
   navigationTargets?: NavigationTargetsApi;
@@ -70,8 +72,12 @@ export interface DownloadCaptureOptions {
   maxByteSize?: number;
   timeoutMs: number;
   signal?: AbortSignal;
+  /** Input revocation may keep a download whose id was already attributed. */
+  inputSignal?: AbortSignal;
   /** `markDispatched` must be called immediately before the mouse press is sent. */
-  trigger(markDispatched: () => void): Promise<ClickResult | RpcError>;
+  trigger(markDispatched: () => void, signal: AbortSignal): Promise<ClickResult | RpcError>;
+  /** Retire the trigger and release any held input within this cleanup deadline. */
+  cleanupTrigger?(deadline: number): Promise<void>;
 }
 
 export interface DownloadCaptureResult {
@@ -90,6 +96,7 @@ interface DownloadCandidate {
   suggest: (suggestion?: chrome.downloads.DownloadFilenameSuggestion) => void;
   suggested: boolean;
   afterDispatch: boolean;
+  graceExpired?: boolean;
   graceTimer: ReturnType<typeof setTimeout>;
 }
 
@@ -98,8 +105,10 @@ function safeBasename(filename: string): string {
   return basename && basename !== "." && basename !== ".." ? basename : "download";
 }
 
-function sameTarget(source: { tabId?: number; sessionId?: string }, target: CdpTarget): boolean {
-  return source.tabId === target.tabId && source.sessionId === target.sessionId;
+function isInBrowserRelativeDir(filename: string, browserRelativeDir: string): boolean {
+  const parent = filename.split(/[\\/]/).slice(0, -1);
+  const expected = browserRelativeDir.split("/");
+  return parent.slice(-expected.length).join("/") === browserRelativeDir;
 }
 
 function matchesIntent(item: chrome.downloads.DownloadItem, intent: DownloadIntent): boolean {
@@ -158,6 +167,8 @@ async function cleanupClaimedDownload(downloads: DownloadsApi, downloadId: numbe
 export async function captureBrowserDownload(
   options: DownloadCaptureOptions,
 ): Promise<DownloadCaptureResult | RpcError> {
+  const deadline = Date.now() + options.timeoutMs;
+  const triggerController = new AbortController();
   let click: ClickResult | undefined;
   let intent: DownloadIntent | undefined;
   let dispatched = false;
@@ -165,6 +176,7 @@ export async function captureBrowserDownload(
   let capturedId: number | undefined;
   let settled = false;
   let succeeded = false;
+  let preserveOutsideDownload = false;
   let failureResult: RpcError | undefined;
   let uniquenessTimer: ReturnType<typeof setTimeout> | undefined;
   let operationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -178,9 +190,12 @@ export async function captureBrowserDownload(
     resolveCompletion = resolve;
     rejectCompletion = reject;
   });
+  // The trigger may still be pending when timeout, abort or attribution fails.
+  void completion.catch(() => undefined);
   const fail = (error: Error) => {
     if (settled) return;
     settled = true;
+    triggerController.abort();
     rejectCompletion(error);
   };
   const complete = (item: chrome.downloads.DownloadItem) => {
@@ -200,10 +215,10 @@ export async function captureBrowserDownload(
   };
   const matchesCdpIntent = (candidate: DownloadCandidate): boolean =>
     intent !== undefined && matchesIntent(candidate.item, intent);
-  // Pre-dispatch candidates cannot come from the popup opened by this click.
+  // Pre-dispatch candidates cannot come from the click or popup triggered here.
   const attributable = (candidate: DownloadCandidate): boolean =>
-    matchesCdpIntent(candidate) ||
-    (candidate.afterDispatch && matchesPopupUrl(candidate.item, popupUrls));
+    candidate.afterDispatch &&
+    (matchesCdpIntent(candidate) || matchesPopupUrl(candidate.item, popupUrls));
   const matchingCandidates = (): DownloadCandidate[] =>
     [...candidates.values()].filter((candidate) => !candidate.suggested && attributable(candidate));
 
@@ -222,6 +237,14 @@ export async function captureBrowserDownload(
     candidate.suggested = true;
     clearTimeout(candidate.graceTimer);
     capturedId = candidate.item.id;
+    // Release any other unrelated concurrent downloads immediately instead of
+    // stalling their Chrome filename suggestion until this transfer finishes.
+    for (const other of [...candidates.values()]) {
+      if (other.item.id === candidate.item.id) continue;
+      clearTimeout(other.graceTimer);
+      suggestDefault(other);
+      candidates.delete(other.item.id);
+    }
     const filename =
       intent && matchesCdpIntent(candidate) ? intent.suggestedFilename : candidate.item.filename;
     candidate.suggest({
@@ -253,25 +276,37 @@ export async function captureBrowserDownload(
     }
   };
 
+  let pendingHierarchyChecks = 0;
+  const expireCandidate = (candidate: DownloadCandidate) => {
+    if (settled || capturedId !== undefined || !candidates.has(candidate.item.id)) return;
+    if (pendingHierarchyChecks > 0) {
+      candidate.graceExpired = true;
+      return;
+    }
+    suggestDefault(candidate);
+    candidates.delete(candidate.item.id);
+    if (attributable(candidate) && capturedId === undefined) {
+      fail(new Error("download correlation grace elapsed before unique attribution"));
+    }
+  };
   const determiningListener: DeterminingFilenameListener = (item, suggest) => {
+    if (settled || capturedId !== undefined) {
+      suggest();
+      return;
+    }
     const candidate: DownloadCandidate = {
       item,
       suggest,
       suggested: false,
       afterDispatch: dispatched,
-      graceTimer: setTimeout(() => {
-        suggestDefault(candidate);
-        candidates.delete(item.id);
-        if (attributable(candidate) && capturedId === undefined) {
-          fail(new Error("download correlation grace elapsed before unique attribution"));
-        }
-      }, CORRELATION_GRACE_MS),
+      graceTimer: setTimeout(() => expireCandidate(candidate), CORRELATION_GRACE_MS),
     };
     candidates.set(item.id, candidate);
     reconcile();
     return true;
   };
   const createdListener = (item: chrome.downloads.DownloadItem) => {
+    if (settled) return;
     createdItems.set(item.id, item);
     if (capturedId !== item.id) return;
     if (item.state === "interrupted") {
@@ -297,66 +332,188 @@ export async function captureBrowserDownload(
     }
   };
   const onAbort = () => fail(new DOMException("aborted", "AbortError"));
+  const onInputAbort = () => {
+    triggerController.abort();
+    // Before attribution, a later download might belong to the person instead.
+    // Never capture or cancel it using the retired click's observation.
+    if (capturedId === undefined) onAbort();
+  };
   const navigationTargetListener = (
     details: chrome.webNavigation.WebNavigationSourceCallbackDetails,
   ) => {
-    if (!dispatched || details.sourceTabId !== options.target.tabId) return;
+    if (settled || !dispatched || details.sourceTabId !== options.handle.tabId) return;
     popupUrls.add(details.url);
     reconcile();
   };
-  const cdpSubscription = options.cdp.onEvent?.((source, method, raw) => {
-    if (method !== "Page.downloadWillBegin" || !sameTarget(source, options.target)) return;
-    const event = raw as { url?: unknown; suggestedFilename?: unknown; frameId?: unknown };
-    if (typeof event.url !== "string" || typeof event.suggestedFilename !== "string") return;
-    if (options.expectedFrameId && event.frameId !== options.expectedFrameId) {
-      fail(new Error("download originated from a different frame"));
-      return;
+  const targetFrameId = options.expectedFrameId || options.handle.frameId || undefined;
+  const frameParents = new Map<string, string>();
+  let hierarchyGraphPromise: Promise<FrameDocumentGraph | undefined> | undefined;
+  const isDescendantOf = (frameId: string, ancestorId: string): boolean => {
+    const seen = new Set<string>();
+    let current: string | undefined = frameId;
+    while (current && !seen.has(current)) {
+      if (current === ancestorId) return true;
+      seen.add(current);
+      current = frameParents.get(current);
     }
+    return false;
+  };
+  const recordIntent = (nextIntent: DownloadIntent) => {
+    if (settled) return;
+    if (capturedId !== undefined && options.inputSignal?.aborted) return;
     if (intent) {
       fail(new Error("download trigger produced more than one browser download intent"));
       return;
     }
-    intent = {
+    intent = nextIntent;
+    reconcile();
+  };
+  const loadFrameHierarchy = (refresh = false): Promise<FrameDocumentGraph | undefined> => {
+    if (refresh || !hierarchyGraphPromise) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const budget = Math.min(remaining, 1_500);
+      hierarchyGraphPromise = waitBounded(
+        options.cdp.getFrameDocuments(options.handle.tabId, options.signal, {
+          includeOwners: false,
+          skipQuietWaitWhenIdle: true,
+          childReadTimeoutMs: Math.min(budget, 500),
+        }),
+        Date.now() + budget,
+        options.signal,
+        "resolving download frame hierarchy timed out",
+      )
+        .then((graph) => {
+          for (const frame of graph.frames) {
+            if (frame.parentFrameId) frameParents.set(frame.frameId, frame.parentFrameId);
+          }
+          for (const unavailable of graph.unavailableFrames ?? []) {
+            if (unavailable.parentFrameId) {
+              frameParents.set(unavailable.frameId, unavailable.parentFrameId);
+            }
+          }
+          return graph;
+        })
+        .catch(() => undefined);
+    }
+    return hierarchyGraphPromise;
+  };
+  const cdpSubscription = options.cdp.onEvent(options.handle.tabId, (source, method, raw) => {
+    if (settled || source.tabId !== options.handle.tabId) return;
+    if (method === "Page.frameAttached") {
+      const attached = raw as { frameId?: unknown; parentFrameId?: unknown };
+      if (typeof attached.frameId === "string" && typeof attached.parentFrameId === "string") {
+        frameParents.set(attached.frameId, attached.parentFrameId);
+      }
+      return;
+    }
+    if (method !== "Page.downloadWillBegin") return;
+    if (!dispatched) return;
+    if (capturedId !== undefined && options.inputSignal?.aborted) return;
+    const event = raw as { url?: unknown; suggestedFilename?: unknown; frameId?: unknown };
+    if (typeof event.url !== "string" || typeof event.suggestedFilename !== "string") return;
+    const eventFrameId =
+      typeof event.frameId === "string" && event.frameId.length > 0 ? event.frameId : undefined;
+    const parsedIntent: DownloadIntent = {
       url: event.url,
       suggestedFilename: event.suggestedFilename,
-      ...(typeof event.frameId === "string" ? { frameId: event.frameId } : {}),
+      ...(eventFrameId ? { frameId: eventFrameId } : {}),
     };
-    reconcile();
-  });
-  if (!cdpSubscription) {
-    return captureError("CDP download intent subscription unavailable", "none", "arm");
-  }
-
-  options.downloads.onDeterminingFilename.addListener(determiningListener);
-  options.downloads.onCreated.addListener(createdListener);
-  options.downloads.onChanged.addListener(changedListener);
-  options.navigationTargets?.onCreatedNavigationTarget.addListener(navigationTargetListener);
-  options.signal?.addEventListener("abort", onAbort, { once: true });
-  operationTimer = setTimeout(
-    () => fail(new Error("download did not complete before timeout")),
-    options.timeoutMs,
-  );
-  sizePoll = setInterval(() => {
-    if (capturedId === undefined || settled || options.maxByteSize === undefined) return;
-    void options.downloads
-      .search({ id: capturedId })
-      .then(([item]) => {
-        if (!item || settled) return;
-        if (item.bytesReceived > (options.maxByteSize as number)) {
-          fail(new Error(`download exceeds transfer limit ${options.maxByteSize}`));
+    const exactFrame =
+      options.cdp.isEventFromFrame(source, options.handle) &&
+      (!targetFrameId || !eventFrameId || eventFrameId === targetFrameId);
+    if (
+      exactFrame ||
+      !targetFrameId ||
+      (eventFrameId !== undefined && isDescendantOf(eventFrameId, targetFrameId))
+    ) {
+      recordIntent(parsedIntent);
+      return;
+    }
+    // Hidden download iframes (<iframe src="/export">, <form target="hidden-iframe">)
+    // and cross-origin CDN download iframes may already exist before this click or
+    // run in a child OOPIF target. Resolve the tab's frame hierarchy lazily and accept
+    // downloads from targetFrameId's subtree (or any frame in the tab when triggered
+    // from the root main document), while still ignoring unrelated sibling frames.
+    pendingHierarchyChecks++;
+    void loadFrameHierarchy()
+      .then(async (graph) => {
+        if (settled || !graph) return;
+        let accepted =
+          graph.rootFrameId === targetFrameId ||
+          (eventFrameId !== undefined && isDescendantOf(eventFrameId, targetFrameId));
+        if (!accepted && eventFrameId !== undefined && !frameParents.has(eventFrameId)) {
+          const refreshed = await loadFrameHierarchy(true);
+          if (settled || !refreshed) return;
+          accepted =
+            refreshed.rootFrameId === targetFrameId || isDescendantOf(eventFrameId, targetFrameId);
         }
+        if (accepted) recordIntent(parsedIntent);
       })
-      .catch((err) => fail(err instanceof Error ? err : new Error(String(err))));
-  }, SIZE_POLL_MS);
+      .finally(() => {
+        pendingHierarchyChecks = Math.max(0, pendingHierarchyChecks - 1);
+        if (pendingHierarchyChecks === 0 && !settled && capturedId === undefined) {
+          for (const candidate of [...candidates.values()]) {
+            if (candidate.graceExpired && !attributable(candidate)) {
+              expireCandidate(candidate);
+            }
+          }
+          reconcile();
+        }
+      });
+  });
+  let releaseTabAttachment: (() => void) | undefined;
 
   try {
-    const triggered = await options.trigger(() => {
-      dispatched = true;
-    });
+    releaseTabAttachment = options.cdp.retainTabAttachment(options.handle.tabId);
+    options.downloads.onDeterminingFilename.addListener(determiningListener);
+    options.downloads.onCreated.addListener(createdListener);
+    options.downloads.onChanged.addListener(changedListener);
+    options.navigationTargets?.onCreatedNavigationTarget.addListener(navigationTargetListener);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    options.inputSignal?.addEventListener("abort", onInputAbort, { once: true });
+    operationTimer = setTimeout(
+      () => fail(new Error("download did not complete before timeout")),
+      options.timeoutMs,
+    );
+    sizePoll = setInterval(() => {
+      if (capturedId === undefined || settled || options.maxByteSize === undefined) return;
+      void options.downloads
+        .search({ id: capturedId })
+        .then(([item]) => {
+          if (!item || settled) return;
+          if (item.bytesReceived > (options.maxByteSize as number)) {
+            fail(new Error(`download exceeds transfer limit ${options.maxByteSize}`));
+          }
+        })
+        .catch((err) => fail(err instanceof Error ? err : new Error(String(err))));
+    }, SIZE_POLL_MS);
+
+    if (options.signal?.aborted || options.inputSignal?.aborted)
+      throw new DOMException("aborted", "AbortError");
+    // A failed completion can stop a pending trigger, while successful file
+    // completion still needs a click acknowledgement within the same deadline.
+    const captureFailure = completion.then(() => new Promise<never>(() => {}));
+    const triggered = await waitBounded(
+      Promise.race([
+        options.trigger(() => {
+          if (triggerController.signal.aborted) throw new DOMException("aborted", "AbortError");
+          dispatched = true;
+        }, triggerController.signal),
+        captureFailure,
+      ]),
+      deadline,
+      options.signal,
+      "download trigger timed out",
+    );
     if (isRpcError(triggered)) {
       void completion.catch(() => undefined);
+      // No download event yet does not undo a click already delivered to the page.
       const effect: TransferEffectState =
-        capturedId !== undefined ? "committed" : intent || popupUrls.size > 0 ? "unknown" : "none";
+        capturedId !== undefined
+          ? "committed"
+          : dispatched || intent || popupUrls.size > 0
+            ? "unknown"
+            : "none";
       failureResult = {
         ...triggered,
         data: { ...triggered.data, effect_state: effect, phase: "trigger" },
@@ -365,11 +522,27 @@ export async function captureBrowserDownload(
     }
     click = triggered;
     const item = await completion;
+    // Another extension can override our suggestion, so validate the completed path.
+    if (!isInBrowserRelativeDir(item.filename, options.browserRelativeDir)) {
+      // The final location may be user-selected, so leave the file in place.
+      preserveOutsideDownload = true;
+      failureResult = transferError(
+        "cdp_failed",
+        "download_path_mismatch",
+        "the browser did not use the requested download directory",
+        { effectState: "committed", phase: "download" },
+      );
+      return failureResult;
+    }
     succeeded = true;
     return { click, item };
   } catch (err) {
     const effect: TransferEffectState =
-      capturedId !== undefined ? "committed" : click ? "unknown" : "none";
+      capturedId !== undefined
+        ? "committed"
+        : dispatched || click || intent || popupUrls.size > 0
+          ? "unknown"
+          : "none";
     failureResult = captureError(
       err instanceof Error ? err.message : String(err),
       effect,
@@ -378,10 +551,12 @@ export async function captureBrowserDownload(
     return failureResult;
   } finally {
     settled = true;
+    triggerController.abort();
     if (operationTimer) clearTimeout(operationTimer);
     if (uniquenessTimer) clearTimeout(uniquenessTimer);
     if (sizePoll) clearInterval(sizePoll);
     options.signal?.removeEventListener("abort", onAbort);
+    options.inputSignal?.removeEventListener("abort", onInputAbort);
     options.downloads.onDeterminingFilename.removeListener(determiningListener);
     options.downloads.onCreated.removeListener(createdListener);
     options.downloads.onChanged.removeListener(changedListener);
@@ -391,12 +566,28 @@ export async function captureBrowserDownload(
       clearTimeout(candidate.graceTimer);
       if (candidate.item.id !== capturedId) suggestDefault(candidate);
     }
-    if (!succeeded && capturedId !== undefined) {
-      try {
-        await cleanupClaimedDownload(options.downloads, capturedId);
-      } catch {
-        if (failureResult?.data) failureResult.data.cleanup_state = "failed";
+    const cleanupDeadline = Date.now() + CLEANUP_TIMEOUT_MS;
+    const cleanups: Promise<void>[] = [];
+    if (options.cleanupTrigger) cleanups.push(options.cleanupTrigger(cleanupDeadline));
+    if (!succeeded && !preserveOutsideDownload && capturedId !== undefined) {
+      cleanups.push(cleanupClaimedDownload(options.downloads, capturedId));
+    }
+    try {
+      // One failed cleanup must not skip or outlive the other. Start both
+      // while this capture still owns the gate and share one bounded budget.
+      const results = await waitBounded(
+        Promise.allSettled(cleanups),
+        cleanupDeadline,
+        undefined,
+        "download cleanup timed out",
+      );
+      if (results.some((result) => result.status === "rejected") && failureResult?.data) {
+        failureResult.data.cleanup_state = "failed";
       }
+    } catch {
+      if (failureResult?.data) failureResult.data.cleanup_state = "failed";
+    } finally {
+      releaseTabAttachment?.();
     }
   }
 }

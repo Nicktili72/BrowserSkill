@@ -9,9 +9,10 @@ not launch Chrome or accept Chrome's `--profile-directory` argument.
 1. Open the required profile in Chrome. If you need to verify its directory, open
    `chrome://version` in that window and check **Profile Path**.
 2. Open BrowserSkill's popup in that same profile and ensure it is connected.
-3. Choose **Copy profile instructions** and send the instructions along with your
-   task to the agent. The copied instruction includes this profile's extension
-   instance ID and requires it on every new session for the task.
+3. Choose **Copy instructions** next to the current browser name and send the
+   instructions along with your task to the agent. The copied instruction identifies
+   the browser by its saved name and requires its extension instance ID on every
+   new session for the task. Renaming changes the description, not the routing ID.
 
 You can also copy the **Instance ID** from the popup and use it directly:
 
@@ -25,7 +26,8 @@ profile display name or directory name. An existing, verified unique BrowserSkil
 label also works; labels are not populated from Chrome profile names automatically.
 The instruction only copies text: it does not start a session or change settings.
 
-For a reusable human-readable selector, set **Browser name** in the extension popup,
+For a reusable human-readable selector, use the pencil beside the current browser
+name in the extension popup to edit and save **Browser name**,
 then confirm it appears in `bsk browsers`. Keep names unique among connected browsers;
 label matching is exact and duplicate labels are rejected as ambiguous. Saving a name
 briefly reconnects BrowserSkill so the daemon sees it immediately. Renaming is disabled
@@ -48,17 +50,52 @@ the instance ID; verify the mapping again instead of substituting another browse
 Copying a whole profile can also copy its extension storage, so instance IDs are
 routing identifiers, not independent proof of a filesystem path.
 
-## DeepSeek Harness
+## Incognito Agent Windows
 
-Use the verified popup instance ID in the plugin's session tool:
+To isolate a task from the selected profile's ordinary website login state, enable
+**chrome://extensions → BrowserSkill → Details → Allow in incognito**, then run:
 
-```text
-browser_session({ action: "start", browser: "<verified-instance-id>" })
+```sh
+bsk session start --browser <instance-id> --incognito --json
 ```
 
-**Copy profile instructions** includes this tool call alongside the CLI command.
-Use the DeepSeek Harness call instead of running a separate CLI session. The plugin
-manages its own sessions. Supply the same selector on every new session for the task, even if
+Without `--incognito`, sessions continue to use normal windows. Incognito starts
+require daemon and extension protocol 1.4 or later. Missing permission, an older
+peer, or a browser refusal returns an error; BrowserSkill never retries the start
+as a normal window. Direct extension callers can pass `incognito: true` to
+`tool.session_start`.
+
+Incognito sessions create their own tabs and cannot borrow user tabs. Normal
+sessions also cannot borrow incognito tabs. Navigation, input and screenshots use
+the same tools as normal sessions.
+
+All incognito windows in the same profile share one incognito cookie jar, including
+windows opened by the user and other tasks. Closing one Agent Window does not clear
+that shared state while another incognito window remains open. Chrome clears the
+incognito website data when the last incognito window closes. This is isolation
+from normal browsing, not a separate cookie jar per task.
+
+Stopping a session still closes its agent-created tabs and preserves user-created
+tabs and protected popups. Such tabs may keep the incognito window and its browsing
+session alive. Downloads and BrowserSkill's own operation history follow their
+existing retention rules.
+
+## MCP clients
+
+Use the verified popup instance ID in `bsk_session`:
+
+```text
+bsk_session({ action: "start", browser: "<verified-instance-id>" })
+```
+
+For an incognito Agent Window, add `incognito: true` to that call. The extension
+must have **Allow in incognito** enabled, and the CLI, daemon and extension
+must support protocol 1.4 or later; a missing permission or an older peer returns an
+error instead of retrying as a normal window.
+
+**Copy instructions** includes this tool call alongside the CLI command.
+When using MCP, call `bsk_session` instead of running a separate CLI session.
+Supply the same selector on every new session for the task, even if
 only one browser is connected. If the mapping is unknown or the target is offline,
 ask the user to confirm or reconnect it; do not retry without `browser`.
 
@@ -66,7 +103,7 @@ ask the user to confirm or reconnect it; do not retry without `browser`.
 
 This is a manual profile-to-instance workflow, not automatic profile discovery or
 a persisted task/workspace requirement. Explicit selectors reject unavailable or
-ambiguous targets. Neither the CLI nor the DSH plugin can infer a profile requirement
+ambiguous targets. Neither the CLI nor `bsk mcp` can infer a profile requirement
 from the user's conversation if the agent omits the selector: with only one browser
 connected, an unqualified start can still select the wrong profile. The skill and
 copied instructions guide the agent; they do not enforce a binding on future calls.
