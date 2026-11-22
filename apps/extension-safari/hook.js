@@ -57,13 +57,101 @@ function bskMain() {
 
   addEventListener('error', (e) => {
     if (e.target && e.target !== window) { // a failed <img>/<script>/<link> load
-      push('log', 'error', `Failed to load resource: ${e.target.src || e.target.href || e.target.tagName}`);
+      const failed = e.target.src || e.target.href || e.target.tagName;
+      push('log', 'error', `Failed to load resource: ${failed}`);
+      resourceFailed(abs(failed), TAG_TYPES[e.target.tagName] || 'Other');
     } else {
       push('exception', 'error', `Uncaught ${e.message}`, { url: e.filename, line: e.lineno, column: e.colno, stack: e.error && e.error.stack });
     }
   }, true);
   addEventListener('unhandledrejection', (e) => push('exception', 'error', `Unhandled promise rejection: ${str(e.reason)}`, { stack: e.reason && e.reason.stack }));
   addEventListener('securitypolicyviolation', (e) => push('log', 'error', `CSP violation: ${e.violatedDirective} blocked ${e.blockedURI}`, { url: e.sourceFile, line: e.lineNumber, column: e.columnNumber }));
+
+  // ---- network ----------------------------------------------------------
+  // Safari gives an extension no network events, so this records what the
+  // page itself does: fetch() and XMLHttpRequest are wrapped (method, status,
+  // MIME type, failures), and everything else (images, scripts, stylesheets,
+  // iframes, the document itself) comes from Resource Timing, which has a
+  // status only for same-origin / Timing-Allow-Origin responses. Request and
+  // response bodies and headers are never read.
+  const netBuf = [];
+  let netSeq = 0;
+  const net = (e) => {
+    netBuf.push({ sequence: ++netSeq, timestamp: Date.now(), ...e });
+    if (netBuf.length > MAX_ENTRIES) netBuf.shift();
+  };
+  const abs = (u) => { try { return new URL(u && u.url ? u.url : String(u), location.href).href; } catch { return String(u); } };
+  const mime = (ct) => (String(ct || '').split(';')[0].trim() || undefined);
+  const RESOURCE_TYPES = { img: 'Image', image: 'Image', script: 'Script', css: 'Stylesheet', link: 'Stylesheet', iframe: 'Document', frame: 'Document', navigation: 'Document', video: 'Media', audio: 'Media', beacon: 'Ping', font: 'Font' };
+  const TAG_TYPES = { IMG: 'Image', SCRIPT: 'Script', LINK: 'Stylesheet', IFRAME: 'Document', VIDEO: 'Media', AUDIO: 'Media', SOURCE: 'Media' };
+
+  if (typeof window.fetch === 'function') {
+    const origFetch = window.fetch;
+    window.fetch = function (input, init) {
+      const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      const url = abs(input);
+      const p = origFetch.apply(this, arguments);
+      p.then(
+        (res) => net({ kind: 'response', method, url, status: res.status || undefined, status_text: res.statusText || undefined, mime_type: mime(res.headers && res.headers.get('content-type')), resource_type: 'Fetch' }),
+        (err) => net({ kind: 'failure', method, url, error_text: String((err && err.message) || err), resource_type: 'Fetch' }),
+      );
+      return p; // the page gets the original promise untouched
+    };
+  }
+
+  if (typeof window.XMLHttpRequest === 'function') {
+    const proto = XMLHttpRequest.prototype;
+    const meta = new WeakMap();
+    const origOpen = proto.open, origSend = proto.send;
+    proto.open = function (method, url) {
+      meta.set(this, { method: String(method).toUpperCase(), url: abs(url) });
+      return origOpen.apply(this, arguments);
+    };
+    proto.send = function () {
+      const m = meta.get(this);
+      if (m) {
+        const xhr = this;
+        const fail = (why) => () => net({ kind: 'failure', ...m, error_text: why, resource_type: 'XHR' });
+        xhr.addEventListener('load', () => net({ kind: 'response', ...m, status: xhr.status || undefined, status_text: xhr.statusText || undefined, mime_type: mime(xhr.getResponseHeader('content-type')), resource_type: 'XHR' }));
+        xhr.addEventListener('error', fail('network error'));
+        xhr.addEventListener('abort', fail('aborted'));
+        xhr.addEventListener('timeout', fail('timeout'));
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  // Safari also reports Resource Timing entries for loads that FAILED, so a
+  // timing entry is held for a moment: if the element's own error event
+  // arrives for the same URL, the entry is dropped and only the failure is
+  // recorded (otherwise a broken image would show as a status-less "response").
+  const GRACE_MS = 250;
+  const pending = new Set(); // { url, timer, entry }
+  const failedUrls = new Set();
+  const commit = (p) => { clearTimeout(p.timer); pending.delete(p); net(p.entry); };
+  const flushPending = () => [...pending].forEach(commit);
+  const fromTiming = (e) => {
+    if (e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest') return; // already recorded above
+    if (failedUrls.has(e.name)) return; // the error event got here first
+    const p = { url: e.name, entry: { kind: 'response', method: 'GET', url: e.name, status: e.responseStatus || undefined, resource_type: RESOURCE_TYPES[e.initiatorType] || 'Other', timestamp: Math.round(performance.timeOrigin + (e.responseEnd || e.startTime || 0)) } };
+    p.timer = setTimeout(() => commit(p), GRACE_MS);
+    pending.add(p);
+  };
+  const resourceFailed = (url, resource_type) => {
+    if (failedUrls.size > 500) failedUrls.clear();
+    failedUrls.add(url);
+    for (const p of [...pending]) if (p.url === url) { clearTimeout(p.timer); pending.delete(p); }
+    net({ kind: 'failure', method: 'GET', url, error_text: 'failed to load', resource_type });
+  };
+  if (typeof PerformanceObserver === 'function') {
+    try { new PerformanceObserver((list) => list.getEntries().forEach(fromTiming)).observe({ type: 'resource', buffered: true }); } catch { /* old Safari: no network entries for subresources */ }
+  }
+  addEventListener('DOMContentLoaded', () => {
+    try {
+      const n = performance.getEntriesByType('navigation')[0];
+      if (n) net({ kind: 'response', method: 'GET', url: location.href, status: n.responseStatus || undefined, mime_type: mime(document.contentType), resource_type: 'Document' });
+    } catch { /* ignore */ }
+  });
 
   const serialize = (v) => {
     if (v === undefined) return undefined;
@@ -86,6 +174,9 @@ function bskMain() {
     if (req.type === 'console') {
       const entries = buf.filter((e) => e.sequence > (req.since || 0)).map(({ stack, ...e }) => (req.includeStack && stack ? { ...e, stack_trace: frames(stack).slice(1).filter((f) => !/^webkit-masked-url:/.test(f.url)) } : e));
       reply({ entries, lastSequence: seq });
+    } else if (req.type === 'network') {
+      flushPending(); // anything still in its grace period is reported now
+      reply({ entries: netBuf.filter((e) => e.sequence > (req.since || 0)), lastSequence: netSeq });
     } else if (req.type === 'eval') {
       try {
         let v = (0, eval)(req.expression); // indirect eval: global scope, like Runtime.evaluate

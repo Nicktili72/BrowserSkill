@@ -3,7 +3,7 @@
 // implements a reduced tool set: session_start/stop, tab_list/create/close/
 // select/borrow/return, navigate, snapshot, observe, click, fill, press,
 // select, focus, blur, wheel, scroll_to, get_html, wait_for_navigation,
-// evaluate, console, screenshot. Anything else in bsk-protocol's Method enum gets a clean
+// evaluate, console, network, screenshot. Anything else in bsk-protocol's Method enum gets a clean
 // `unsupported` error rather than silently doing nothing — see NOTES.md
 // for what's out of scope and why.
 //
@@ -303,6 +303,12 @@ function makeBackground(env) {
     'tool.console': async (p) => {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
       const r = await page(tabId, { op: 'console', since: p.since, limit: p.limit, maxTextChars: p.max_text_chars, includeStack: p.include_stack });
+      return { tab_id: tabId, entries: r.entries, next_since: r.nextSince, truncated: r.truncated };
+    },
+
+    'tool.network': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'network', since: p.since, limit: p.limit, maxTextChars: p.max_text_chars });
       return { tab_id: tabId, entries: r.entries, next_since: r.nextSince, truncated: r.truncated };
     },
 

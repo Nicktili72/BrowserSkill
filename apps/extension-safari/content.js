@@ -189,6 +189,18 @@
       });
       return { entries, nextSince: entries.length ? entries[entries.length - 1].sequence : m.since || 0, truncated: r.entries.length > limit };
     },
+    network: async (m) => {
+      const limit = Math.min(m.limit || 100, 500);
+      const maxText = Math.min(m.maxTextChars || 2000, 10000);
+      const r = await callMain({ type: 'network', since: m.since || 0 }, { ackMs: m.ackMs });
+      const clip = (s) => (s === undefined ? [undefined, false] : [String(s).slice(0, maxText), String(s).length > maxText]);
+      const entries = r.entries.slice(0, limit).map((e) => {
+        const [url, urlCut] = clip(e.url);
+        const [errorText, errCut] = clip(e.error_text);
+        return { sequence: e.sequence, kind: e.kind, method: e.method, url, status: e.status, status_text: e.status_text, mime_type: e.mime_type, resource_type: e.resource_type, error_text: errorText, timestamp: e.timestamp, truncated: urlCut || errCut };
+      });
+      return { entries, nextSince: entries.length ? entries[entries.length - 1].sequence : m.since || 0, truncated: r.entries.length > limit };
+    },
     getHtml: (m) => {
       const { el, usedRef, usedSelector } = m.ref || m.selector ? resolve(m) : { el: document.documentElement };
       const bytes = new TextEncoder().encode(el.outerHTML);

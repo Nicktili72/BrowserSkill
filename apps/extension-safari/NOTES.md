@@ -73,9 +73,9 @@ The daemon checks for new `bsk` releases and, by default, replaces its own binar
 
 ## Command coverage vs the Chrome extension
 
-Safari has no debugger/CDP, so everything is done from a content script plus `browser.tabs`/`windows`. What's implemented lives in `background.js`'s `tools` table; page-side logic in `content.js`'s `ops`. Still `unsupported`: `upload`, `download`, `network`, `debug`, `record`, `hover`, `request_help`.
+Safari has no debugger/CDP, so everything is done from a content script plus `browser.tabs`/`windows`. What's implemented lives in `background.js`'s `tools` table; page-side logic in `content.js`'s `ops`. Still `unsupported`: `upload`, `download`, `debug`, `record`, `hover`, `request_help`.
 
-Candidates for next, roughly by effort: `network` (wrap `fetch`/XHR in `hook.js`; misses images/scripts and anything before injection), `upload` (set a File on an input via `DataTransfer`), `hover` (synthetic mouse events only — CSS `:hover` won't trigger). Not feasible from an extension: `download` (no downloads API in Safari), dialog handling, trusted (`isTrusted`) input, moving a borrowed tab into the Agent Window.
+Candidates for next, roughly by effort: `upload` (set a File on an input via `DataTransfer`), `hover` (synthetic mouse events only — CSS `:hover` won't trigger). Not feasible from an extension: `download` (no downloads API in Safari), dialog handling, trusted (`isTrusted`) input, moving a borrowed tab into the Agent Window.
 
 ## The page-world script (`hook.js`) — what was learned on real Safari 27.3
 
@@ -83,6 +83,7 @@ Candidates for next, roughly by effort: `network` (wrap `fetch`/XHR in `hook.js`
 - **Safari defines `window.browser` (with `runtime.sendMessage`) in the MAIN world** once an extension has a MAIN-world script, so *any web page* can message the background page. Hence the sender check at the top of `background.js`'s `onMessage` listener: only URLs under `browser.runtime.getURL('')` (confirm.html, popup.html) may drive it. Keep it.
 - Because `browser` exists in both worlds, "am I in the isolated world?" must test `browser.runtime.id` (set only there), not `typeof browser`. The first version tested `typeof browser` and wrongly took the CSP-blockable injection path on GitHub.
 - `hook.js` and `content.js` talk over `window` CustomEvents (`bsk-req`/`bsk-res`, JSON strings), with an immediate ack so "script not there" (1.5 s) is distinguishable from "slow evaluation". A page can forge those events, but they only carry the page's own state.
+- **`network` (in `hook.js`)**: wraps `fetch`/XHR for status + failures, and uses a `PerformanceObserver` for everything else. Verified on real Safari 27.3 (Wikipedia, GitHub): Resource Timing's `responseStatus` is **not** populated for subresources (same-origin or not), so those entries have no status. Safari *does* emit Resource Timing entries for loads that failed, so each timing entry is held 250 ms and dropped if the element's `error` event for the same URL arrives (otherwise a broken `<img>` shows up as a status-less "response" plus a failure). A `bsk network --since N` cursor is per page load — after a navigation it can be past the end of the new buffer.
 - Reinstalling the app resets Safari's per-site permission *and* the enable toggle (the panel says "You have not allowed this extension on any websites yet"). Until the user re-ticks it and clicks "Always Allow on Every Website…" (then confirms), tabs report an empty title/URL, `wait_for_navigation` times out and content-script calls hang or return "no response from page" — easy to mistake for a code bug.
 
 ## Updating the notarized app after changing extension JS
