@@ -41,7 +41,7 @@ Then, every time Safari has been fully quit (macOS resets this on every full qui
 
 ### Signing / distribution
 
-A Developer ID–signed, notarized build removes the "Allow Unsigned Extensions" requirement (confirmed: Safari 18.4+ supports Developer ID distribution outside the Mac App Store — see [Apple's docs](https://developer.apple.com/documentation/safariservices/distributing-your-safari-web-extension)). See [`NOTES.md`](NOTES.md) for the full archive/sign/notarize procedure, `check-notarization.sh` to poll readiness, and a confirmed root-cause writeup of why `notarytool` reporting `Accepted` doesn't mean it's ready yet (a real, sometimes multi-hour gap between Apple's approval and ticket-serving systems — not a local or network problem).
+A Developer ID–signed, notarized build removes the "Allow Unsigned Extensions" requirement (confirmed: Safari 18.4+ supports Developer ID distribution outside the Mac App Store — see [Apple's docs](https://developer.apple.com/documentation/safariservices/distributing-your-safari-web-extension)). See [`NOTES.md`](NOTES.md) for the full archive/sign/notarize procedure, `check-notarization.sh` to staple and check, and a troubleshooting note for "Record not found" when stapling (it means the exported app isn't the build you submitted — resubmit the current export).
 
 ## Bugs found and fixed while building this (worth knowing if you touch this code)
 

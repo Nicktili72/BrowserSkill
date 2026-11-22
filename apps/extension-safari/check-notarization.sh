@@ -20,5 +20,5 @@ if xcrun stapler staple "$APP" 2>&1; then
   echo "   now load without Develop → Allow Unsigned Extensions."
 else
   echo ""
-  echo "⏳ Not yet. Not a local problem — see NOTES.md's notarization section."
+  echo "⏳ Not stapled. If it says Record not found, the app is not the build you submitted — see NOTES.md."
 fi
