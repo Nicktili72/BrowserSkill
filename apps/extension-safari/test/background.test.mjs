@@ -164,10 +164,29 @@ test('tab_borrow succeeds once confirm.js\'s message arrives, and does not false
   assert.ok(requestId);
   assert.equal(listeners.length, 1, 'background must register exactly one onMessage listener for confirm.js replies');
 
-  listeners[0]({ type: 'borrow-confirm-result', requestId, allow: true });
+  listeners[0]({ type: 'borrow-confirm-result', requestId, allow: true }, { url: 'safari-web-extension://TESTID/confirm.html' });
 
   const result = await Promise.race([borrowPromise, new Promise((r) => setTimeout(() => r('timeout'), 200))]);
   assert.notEqual(result, 'timeout', 'expected the borrow confirmation to resolve without waiting for its timeout');
   assert.equal(result.tab_id, tab.tab_id);
   assert.equal(result.agent_window_id, tab.window_id, "must report the tab's own window, not the Agent Window it was never moved into");
+});
+
+test('messages from web pages (not our own extension pages) cannot answer a borrow confirmation or read status', async () => {
+  const { env, calls, listeners } = makeEnv();
+  const bg = makeBackground(env);
+  await seedSession(bg);
+  const tab = await bg.dispatch('tool.tab_create', { session_id: 's1', url: 'https://example.com' });
+  const borrow = bg.dispatch('tool.tab_borrow', { session_id: 's1', tab_id: tab.tab_id, confirmation_timeout_ms: 80 });
+  await new Promise((r) => setImmediate(r));
+  const popup = calls.find((c) => c[0] === 'windows.create' && c[1].type === 'popup');
+  const requestId = new URL(popup[1].url.replace('safari-web-extension://TESTID/', 'https://x/')).searchParams.get('requestId');
+
+  const fromPage = { url: 'https://evil.example/page', tab: { id: 1 } };
+  assert.equal(listeners[0]({ type: 'bsk-status-request' }, fromPage), undefined, 'status must not leak to pages');
+  listeners[0]({ type: 'borrow-confirm-result', requestId, allow: true }, fromPage); // forged approval
+  listeners[0]({ type: 'borrow-confirm-result', requestId, allow: true }); // no sender at all
+
+  await assert.rejects(() => borrow, (e) => e.code === 'user_aborted'); // still fails closed on timeout
+  assert.ok(listeners[0]({ type: 'bsk-status-request' }, { url: 'safari-web-extension://TESTID/popup.html' }), 'own popup still gets status');
 });

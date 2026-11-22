@@ -3,7 +3,7 @@
 // implements a reduced tool set: session_start/stop, tab_list/create/close/
 // select/borrow/return, navigate, snapshot, observe, click, fill, press,
 // select, focus, blur, wheel, scroll_to, get_html, wait_for_navigation,
-// screenshot. Anything else in bsk-protocol's Method enum gets a clean
+// evaluate, console, screenshot. Anything else in bsk-protocol's Method enum gets a clean
 // `unsupported` error rather than silently doing nothing — see NOTES.md
 // for what's out of scope and why.
 //
@@ -291,6 +291,21 @@ function makeBackground(env) {
       return withDialogs({ text: r.text, ref_count: r.refCount, tab_id: tabId, truncated: r.truncated });
     },
 
+    // Runs in the page's own JS world via hook.js. A JS *throw* is an
+    // in-band `ok:false` result (per the protocol); "page world not
+    // reachable" is an RPC error instead (see content.js callMain).
+    'tool.evaluate': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'evaluate', expression: p.expression, awaitPromise: p.await_promise, timeoutMs: p.timeout_ms });
+      return withDialogs({ ok: r.evalOk, tab_id: tabId, value: r.value, error: r.error });
+    },
+
+    'tool.console': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'console', since: p.since, limit: p.limit, maxTextChars: p.max_text_chars, includeStack: p.include_stack });
+      return { tab_id: tabId, entries: r.entries, next_since: r.nextSince, truncated: r.truncated };
+    },
+
     'tool.get_html': async (p) => {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
       const r = await page(tabId, { op: 'getHtml', ref: p.ref, selector: p.selector, maxBytes: p.max_bytes });
@@ -405,7 +420,11 @@ function makeBackground(env) {
     return { connected: wsConnected(), activeSession: activeSessionId(), tabCount: [...sessions.values()].reduce((n, s) => n + s.agentTabIds.size, 0) };
   }
 
-  browser.runtime.onMessage.addListener((msg) => {
+  browser.runtime.onMessage.addListener((msg, sender) => {
+    // Safari exposes browser.runtime.sendMessage to page-world scripts, so a
+    // web page can reach this listener. Only our own extension pages
+    // (confirm.html, popup.html) may drive it.
+    if (!String(sender?.url || '').startsWith(browser.runtime.getURL(''))) return;
     if (msg?.type === 'borrow-confirm-result') {
       const finish = pendingConfirmations.get(msg.requestId);
       if (finish) finish(!!msg.allow);

@@ -86,6 +86,30 @@
     return window;
   };
 
+  // Request/response with hook.js in the page world over window CustomEvents
+  // (JSON strings only). hook.js acks immediately, so "no ack" means the
+  // page-world script isn't there (blocked by CSP, or the tab was loaded
+  // before the extension was enabled) — distinct from a slow evaluation.
+  let reqSeq = 0;
+  function callMain(req, { ackMs = 1500, timeoutMs = 30000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const id = ++reqSeq;
+      let ackTimer, doneTimer;
+      const finish = (fn, v) => { clearTimeout(ackTimer); clearTimeout(doneTimer); removeEventListener('bsk-res', on); fn(v); };
+      const on = (ev) => {
+        let r;
+        try { r = JSON.parse(ev.detail); } catch { return; }
+        if (r.id !== id) return;
+        if (r.ack) { clearTimeout(ackTimer); return; }
+        finish(resolve, r);
+      };
+      addEventListener('bsk-res', on);
+      ackTimer = setTimeout(() => finish(reject, { code: 'unsupported', message: 'page-world script unavailable on this page (blocked by its Content-Security-Policy, or the tab loaded before the extension was enabled — reload it)' }), ackMs);
+      doneTimer = setTimeout(() => finish(reject, { code: 'timeout', message: `no result after ${timeoutMs} ms` }), timeoutMs);
+      dispatchEvent(new CustomEvent('bsk-req', { detail: JSON.stringify({ id, ...req }) }));
+    });
+  }
+
   const setValue = (el, v) => {
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
@@ -148,6 +172,23 @@
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height, usedRef, usedSelector };
     },
+    evaluate: async (m) => {
+      const r = await callMain({ type: 'eval', expression: m.expression, awaitPromise: m.awaitPromise }, { ackMs: m.ackMs, timeoutMs: m.timeoutMs });
+      return { evalOk: r.evalOk, value: r.value, error: r.error };
+    },
+    console: async (m) => {
+      const limit = Math.min(m.limit || 100, 500);
+      const maxText = Math.min(m.maxTextChars || 2000, 10000);
+      const r = await callMain({ type: 'console', since: m.since || 0, includeStack: !!m.includeStack }, { ackMs: m.ackMs });
+      const page = r.entries.slice(0, limit);
+      const entries = page.map((e) => {
+        const text = String(e.text);
+        const out = { sequence: e.sequence, kind: e.kind, level: e.level, text: text.slice(0, maxText), url: e.url, line: e.line, column: e.column, timestamp: e.timestamp, truncated: text.length > maxText };
+        if (e.stack_trace) out.stack_trace = e.stack_trace;
+        return out;
+      });
+      return { entries, nextSince: entries.length ? entries[entries.length - 1].sequence : m.since || 0, truncated: r.entries.length > limit };
+    },
     getHtml: (m) => {
       const { el, usedRef, usedSelector } = m.ref || m.selector ? resolve(m) : { el: document.documentElement };
       const bytes = new TextEncoder().encode(el.outerHTML);
@@ -205,9 +246,12 @@
     }),
   };
 
+  // Ops may be sync or async (evaluate/console wait on the page world).
   browser.runtime.onMessage.addListener((m) => {
     if (!m || !ops[m.op]) return;
-    try { return Promise.resolve({ ok: true, ...ops[m.op](m) }); }
-    catch (e) { return Promise.resolve({ ok: false, error: e.code ? e : { code: 'protocol_error', message: String(e.message || e) } }); }
+    return (async () => ops[m.op](m))().then(
+      (r) => ({ ok: true, ...r }),
+      (e) => ({ ok: false, error: e.code ? e : { code: 'protocol_error', message: String(e.message || e) } }),
+    );
   });
 })();

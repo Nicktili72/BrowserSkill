@@ -73,9 +73,17 @@ The daemon checks for new `bsk` releases and, by default, replaces its own binar
 
 ## Command coverage vs the Chrome extension
 
-Safari has no debugger/CDP, so everything is done from a content script plus `browser.tabs`/`windows`. What's implemented lives in `background.js`'s `tools` table; page-side logic in `content.js`'s `ops`. Still `unsupported`: `upload`, `download`, `network`, `console`, `debug`, `record`, `evaluate`, `hover`, `request_help`.
+Safari has no debugger/CDP, so everything is done from a content script plus `browser.tabs`/`windows`. What's implemented lives in `background.js`'s `tools` table; page-side logic in `content.js`'s `ops`. Still `unsupported`: `upload`, `download`, `network`, `debug`, `record`, `hover`, `request_help`.
 
-Candidates for next, roughly by effort: `evaluate`/`console` (needs injecting a script into the page's own world — blocked by strict CSP on some sites), then `network` (wrap `fetch`/XHR; misses images/scripts and anything before injection), `upload` (set a File on an input via `DataTransfer`), `hover` (synthetic mouse events only — CSS `:hover` won't trigger). Not feasible from an extension: `download` (no downloads API in Safari), dialog handling, trusted (`isTrusted`) input, moving a borrowed tab into the Agent Window.
+Candidates for next, roughly by effort: `network` (wrap `fetch`/XHR in `hook.js`; misses images/scripts and anything before injection), `upload` (set a File on an input via `DataTransfer`), `hover` (synthetic mouse events only — CSS `:hover` won't trigger). Not feasible from an extension: `download` (no downloads API in Safari), dialog handling, trusted (`isTrusted`) input, moving a borrowed tab into the Agent Window.
+
+## The page-world script (`hook.js`) — what was learned on real Safari 27.3
+
+- **`"world": "MAIN"` in `manifest.json` is honoured**, and a MAIN-world content script is exempt from the page's CSP (console capture works on GitHub). `evaluate` is not exempt: it needs `eval`, which strict pages forbid; that comes back as an in-band `EvalError`, not an RPC error.
+- **Safari defines `window.browser` (with `runtime.sendMessage`) in the MAIN world** once an extension has a MAIN-world script, so *any web page* can message the background page. Hence the sender check at the top of `background.js`'s `onMessage` listener: only URLs under `browser.runtime.getURL('')` (confirm.html, popup.html) may drive it. Keep it.
+- Because `browser` exists in both worlds, "am I in the isolated world?" must test `browser.runtime.id` (set only there), not `typeof browser`. The first version tested `typeof browser` and wrongly took the CSP-blockable injection path on GitHub.
+- `hook.js` and `content.js` talk over `window` CustomEvents (`bsk-req`/`bsk-res`, JSON strings), with an immediate ack so "script not there" (1.5 s) is distinguishable from "slow evaluation". A page can forge those events, but they only carry the page's own state.
+- Reinstalling the app resets Safari's per-site permission *and* the enable toggle (the panel says "You have not allowed this extension on any websites yet"). Until the user re-ticks it and clicks "Always Allow on Every Website…" (then confirms), tabs report an empty title/URL, `wait_for_navigation` times out and content-script calls hang or return "no response from page" — easy to mistake for a code bug.
 
 ## Updating the notarized app after changing extension JS
 
