@@ -3,7 +3,7 @@
 // implements a reduced tool set: session_start/stop, tab_list/create/close/
 // select/borrow/return, navigate, snapshot, observe, click, fill, press,
 // select, focus, blur, wheel, scroll_to, get_html, wait_for_navigation,
-// evaluate, console, network, screenshot. Anything else in bsk-protocol's Method enum gets a clean
+// evaluate, console, network, upload, hover, screenshot. Anything else in bsk-protocol's Method enum gets a clean
 // `unsupported` error rather than silently doing nothing — see NOTES.md
 // for what's out of scope and why.
 //
@@ -310,6 +310,25 @@ function makeBackground(env) {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
       const r = await page(tabId, { op: 'network', since: p.since, limit: p.limit, maxTextChars: p.max_text_chars });
       return { tab_id: tabId, entries: r.entries, next_since: r.nextSince, truncated: r.truncated };
+    },
+
+    // The daemon inlines each file's bytes as `data_base64` for Safari (the
+    // sandboxed extension cannot read `staged_path`) — see NOTES.md. A daemon
+    // without that patch sends only the path, which we cannot use.
+    'tool.upload': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const files = p.files || [];
+      if (files.some((f) => typeof f.data_base64 !== 'string')) {
+        throw { code: 'unsupported', message: 'tool.upload needs the Safari-aware bsk daemon (it inlines file bytes); this daemon sent only a file path, which Safari cannot read' };
+      }
+      const r = await page(tabId, { op: 'upload', ref: p.ref, selector: p.selector, mode: p.mode, files: files.map((f) => ({ name: f.name, dataBase64: f.data_base64 })) });
+      return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, file_names: r.fileNames });
+    },
+
+    'tool.hover': async (p) => {
+      const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
+      const r = await page(tabId, { op: 'hover', ref: p.ref, selector: p.selector, modifiers: p.modifiers, settleMs: p.settle_ms });
+      return withDialogs({ tab_id: tabId, used_ref: r.usedRef, used_selector: r.usedSelector, x: r.x, y: r.y });
     },
 
     'tool.get_html': async (p) => {

@@ -5,12 +5,12 @@ Lets `bsk` (BrowserSkill's own CLI + daemon, unmodified in spirit) drive **Safar
 This is a from-scratch Safari extension speaking `bsk`'s real wire protocol (`bsk-protocol`), not a bridge process and not a separate tool.
 
 This repo is just the extension — it doesn't carry BrowserSkill's own (large) source tree. `bsk` itself needs one small patch to its daemon before it will accept a Safari connection at all (it only recognizes `chrome-extension://` origins otherwise); that patch is [`daemon-origin-patch.diff`](daemon-origin-patch.diff) in this repo. Either:
-- clone [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill), apply `daemon-origin-patch.diff`, and `cargo build -p bsk`, or
+- clone [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill), apply `daemon-origin-patch.diff` (required) and `daemon-upload-patch.diff` (only needed for `upload`) with `git am`, and `cargo build -p bsk`, or
 - use the [full fork](https://github.com/Nicktili72/BrowserSkill/tree/safari-support) (branch `safari-support`), which already has it applied and also contains this same extension under `apps/extension-safari/`.
 
 ## Status
 
-**Working end-to-end**, verified against a real `bsk daemon` and real Safari: `session start/stop`, `tab_list/create/close/select/borrow/return`, `navigate`, `snapshot`, `observe`, `click`, `fill`, `press`, `select`, `focus`, `blur`, `wheel`, `scroll_to`, `get_html`, `wait_for_navigation`, `evaluate`, `console`, `network`, `screenshot`. Anything else in `bsk-protocol`'s `Method` enum (upload, download, debug, record, hover, request_help) returns a clean `unsupported` RPC error rather than silently no-op'ing.
+**Working end-to-end**, verified against a real `bsk daemon` and real Safari: `session start/stop`, `tab_list/create/close/select/borrow/return`, `navigate`, `snapshot`, `observe`, `click`, `fill`, `press`, `select`, `focus`, `blur`, `wheel`, `scroll_to`, `get_html`, `wait_for_navigation`, `evaluate`, `console`, `network`, `upload`, `hover`, `screenshot`. Anything else in `bsk-protocol`'s `Method` enum (download, debug, record, request_help) returns a clean `unsupported` RPC error rather than silently no-op'ing.
 
 Caveats on the newer ones: `observe` is just `snapshot` (no hover probing or paging); `wheel` dispatches a synthetic wheel event and then scrolls the nearest scrollable element itself (unless the page cancelled the event); `wait_for_navigation` is based on Safari's tab loading/complete status, so `networkidle` is approximated with a fixed 500 ms quiet period and a call made *before* a navigation starts returns immediately.
 
@@ -18,7 +18,11 @@ Caveats on the newer ones: `observe` is just `snapshot` (no hover probing or pag
 
 `network` is recorded by `hook.js` from inside the page, because Safari gives extensions no network events: the page's own `fetch()` and `XMLHttpRequest` calls are wrapped (method, URL, status, status text, MIME type, and failures such as CORS/DNS errors), and everything else (images, scripts, stylesheets, iframes, fonts, the document itself) comes from Resource Timing and element load errors. **Status codes exist only for `fetch`/XHR** — Safari reports no HTTP status for subresources or the document, so those entries have none; a failed image/script/stylesheet load is reported once as a `failure`. Bodies and headers are never read; WebSocket, `sendBeacon` and requests made by the browser itself (favicon, prefetch) are not seen; entries are buffered per page load (1000 max) and start over on navigation.
 
-48/48 Node tests pass (`test/`), plus the page-driver logic (`content.js`) has been exercised live against real DOM. The toolbar icon's popup (`popup.html`) shows daemon connection + session status read-only by design: a popup-side "turn control off" would only stop *new* commands — the daemon keeps its socket either way — so it would be theatre, not a kill switch.
+`upload` needs a second, small daemon patch ([`daemon-upload-patch.diff`](daemon-upload-patch.diff); already applied on the fork's `safari-support` branch). Chrome's extension sets files from a path on disk; Safari's sandboxed extension can't read paths, so for Safari browsers the daemon also inlines each file's bytes (base64, **16 MiB per call**). The page gets real `File` objects via `DataTransfer` (`mode: input` sets `input.files` and fires `input`/`change`; `mode: drop` fires `dragenter`/`dragover`/`drop` with the files). Verified byte-exact (SHA-256 of a 3 MB file read back in the page). Against a stock daemon, `upload` answers `unsupported` with an explanation.
+
+`hover` dispatches **synthetic** pointer/mouse events along the element chain (`over`/`enter`/`move`, and `out`/`leave` on the previous target, with `relatedTarget` and `pointerType: "mouse"`), so script-driven hover menus and tooltips open (verified on a nested jQuery UI menu). The browser's real `:hover` state can't be set from an extension, so **pure-CSS hover effects don't trigger**.
+
+57/57 Node tests pass (`test/`), plus the page-driver logic (`content.js`) has been exercised live against real DOM. The toolbar icon's popup (`popup.html`) shows daemon connection + session status read-only by design: a popup-side "turn control off" would only stop *new* commands — the daemon keeps its socket either way — so it would be theatre, not a kill switch.
 
 ## Why Safari needed its own extension, not a port
 

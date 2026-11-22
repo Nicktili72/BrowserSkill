@@ -1,0 +1,100 @@
+From 137dd80634948166c186e638145e16dd5bf5d8ba Mon Sep 17 00:00:00 2001
+From: NickT72 <35966711+Nicktili72@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 18:32:19 +0300
+Subject: [PATCH] daemon: allow safari-web-extension:// origins on WS handshake
+
+Chrome's origin_allowed() only recognized chrome-extension:// with a
+32-char a-p extension id. Safari Web Extension background pages report
+their origin as safari-web-extension://<UUID>, so the daemon rejected
+every connection attempt from a Safari extension before this.
+
+Adds a lowercase-UUID shape check alongside the existing chrome check,
+plus tests. No change to chrome-extension:// behavior (existing tests
+still pass unmodified).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ crates/bsk-cli/src/daemon/ws.rs | 46 ++++++++++++++++++++++++++++++---
+ 1 file changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/crates/bsk-cli/src/daemon/ws.rs b/crates/bsk-cli/src/daemon/ws.rs
+index 96d60e9..962d36f 100644
+--- a/crates/bsk-cli/src/daemon/ws.rs
++++ b/crates/bsk-cli/src/daemon/ws.rs
+@@ -47,15 +47,33 @@ pub(super) fn origin_allowed(origin: &str, allow_any: bool) -> bool {
+         return true;
+     }
+     // MV3 extension ids are 32 a–p characters per Chrome spec.
+-    let prefix = "chrome-extension://";
+-    if let Some(rest) = origin.strip_prefix(prefix) {
++    let chrome_prefix = "chrome-extension://";
++    if let Some(rest) = origin.strip_prefix(chrome_prefix) {
+         if rest.len() == 32 && rest.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+             return true;
+         }
+     }
++    // Safari Web Extension background pages report their origin as
++    // `safari-web-extension://<UUID>`, lowercase, 8-4-4-4-12 hex groups.
++    let safari_prefix = "safari-web-extension://";
++    if let Some(rest) = origin.strip_prefix(safari_prefix) {
++        if is_lowercase_uuid(rest) {
++            return true;
++        }
++    }
+     false
+ }
+ 
++fn is_lowercase_uuid(s: &str) -> bool {
++    let groups: Vec<&str> = s.split('-').collect();
++    let lens = [8, 4, 4, 4, 12];
++    groups.len() == lens.len()
++        && groups
++            .iter()
++            .zip(lens)
++            .all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
++}
++
+ pub struct WsServer {
+     state: Arc<DaemonState>,
+ }
+@@ -138,7 +156,7 @@ async fn handle_connection(
+         if !origin_allowed(&origin, allow_any) {
+             warn!(?origin, "rejecting WS upgrade with disallowed origin");
+             let mut err = ErrorResponse::new(Some(
+-                "Origin not in chrome-extension allow-list".to_string(),
++                "Origin not in chrome-extension/safari-web-extension allow-list".to_string(),
+             ));
+             *err.status_mut() = StatusCode::FORBIDDEN;
+             return Err(err);
+@@ -738,6 +756,28 @@ mod tests {
+     fn origin_allowlist_bypassed_when_allow_any() {
+         assert!(origin_allowed("http://localhost", true));
+     }
++
++    #[test]
++    fn origin_allowlist_accepts_safari_web_extension_uuid() {
++        assert!(origin_allowed(
++            "safari-web-extension://3610fd31-0161-4c6b-919a-ee9a3edb2c19",
++            false
++        ));
++    }
++
++    #[test]
++    fn origin_allowlist_rejects_safari_uppercase_uuid() {
++        assert!(!origin_allowed(
++            "safari-web-extension://3610FD31-0161-4C6B-919A-EE9A3EDB2C19",
++            false
++        ));
++    }
++
++    #[test]
++    fn origin_allowlist_rejects_safari_malformed_uuid() {
++        assert!(!origin_allowed("safari-web-extension://not-a-uuid", false));
++        assert!(!origin_allowed("safari-web-extension://", false));
++    }
+ }
+ 
+ #[cfg(test)]
+-- 
+2.54.0 (Apple Git-157)
+

@@ -110,6 +110,20 @@
     });
   }
 
+  const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', json: 'application/json', html: 'text/html', zip: 'application/zip', mp4: 'video/mp4', mp3: 'audio/mpeg', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+  const mimeFor = (name) => MIME[String(name).split('.').pop().toLowerCase()] || '';
+  const fileFromBase64 = (name, b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new File([bytes], name, { type: mimeFor(name) });
+  };
+
+  // Hover state: the element the synthetic pointer is currently "over", so the
+  // next hover can fire the matching leave/out events first.
+  let hovered = null;
+  const chain = (el) => { const out = []; for (let n = el; n; n = n.parentElement) out.unshift(n); return out; }; // root … el
+
   const setValue = (el, v) => {
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
@@ -200,6 +214,61 @@
         return { sequence: e.sequence, kind: e.kind, method: e.method, url, status: e.status, status_text: e.status_text, mime_type: e.mime_type, resource_type: e.resource_type, error_text: errorText, timestamp: e.timestamp, truncated: urlCut || errCut };
       });
       return { entries, nextSince: entries.length ? entries[entries.length - 1].sequence : m.since || 0, truncated: r.entries.length > limit };
+    },
+    upload: (m) => {
+      const { el, usedRef, usedSelector } = resolve(m);
+      const files = (m.files || []).map((f) => fileFromBase64(f.name, f.dataBase64));
+      if (!files.length) throw { code: 'invalid_params', message: 'no files to upload' };
+      const dt = new DataTransfer();
+      for (const f of files) dt.items.add(f);
+      if (m.mode === 'drop') {
+        const r = el.getBoundingClientRect();
+        const init = { bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+        for (const t of ['dragenter', 'dragover', 'drop']) el.dispatchEvent(new DragEvent(t, init));
+      } else {
+        if (el.tagName !== 'INPUT' || el.type !== 'file') throw { code: 'invalid_params', message: 'target is not an <input type=file> (use mode "drop" for a drop zone)' };
+        if (files.length > 1 && !el.multiple) throw { code: 'invalid_params', message: 'this file input does not accept multiple files' };
+        el.files = dt.files;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return { usedRef, usedSelector, fileNames: files.map((f) => f.name) };
+    },
+    // Synthetic pointer events only: JS hover handlers (mouseenter/mouseover,
+    // React onMouseEnter, tooltips driven by script) fire, but the browser's
+    // real :hover state — and so pure-CSS hover menus — cannot be triggered
+    // from an extension.
+    hover: async (m) => {
+      const { el, usedRef, usedSelector } = resolve(m);
+      const { x, y } = centerOf(el);
+      const target = document.elementFromPoint(x, y) || el;
+      const mods = m.modifiers || [];
+      const init = { clientX: x, clientY: y, view: window, ctrlKey: mods.includes('Control'), altKey: mods.includes('Alt'), shiftKey: mods.includes('Shift'), metaKey: mods.includes('Meta') };
+      // Real browsers set relatedTarget (where the pointer came from / went to)
+      // and pointerType 'mouse'; libraries that emulate mouseenter/leave from
+      // over/out (jQuery) and hover menus that ignore touch (Radix) depend on both.
+      const fire = (node, type, bubbles, related = null) => {
+        const isPointer = type.startsWith('pointer');
+        const ev = new (isPointer ? PointerEvent : MouseEvent)(type, { ...init, bubbles, cancelable: bubbles, relatedTarget: related, ...(isPointer ? { pointerType: 'mouse', pointerId: 1, isPrimary: true } : {}) });
+        return node.dispatchEvent(ev);
+      };
+      const prev = hovered && hovered.isConnected ? hovered : null;
+      const from = prev ? chain(prev) : [];
+      const to = chain(target);
+      let common = 0;
+      while (common < from.length && common < to.length && from[common] === to[common]) common++;
+      if (prev && prev !== target) {
+        fire(prev, 'pointerout', true, target); fire(prev, 'mouseout', true, target);
+        for (const n of from.slice(common).reverse()) { fire(n, 'pointerleave', false, target); fire(n, 'mouseleave', false, target); }
+      }
+      if (prev !== target) {
+        fire(target, 'pointerover', true, prev); fire(target, 'mouseover', true, prev);
+        for (const n of to.slice(common)) { fire(n, 'pointerenter', false, prev); fire(n, 'mouseenter', false, prev); }
+      }
+      fire(target, 'pointermove', true); fire(target, 'mousemove', true);
+      hovered = target;
+      await new Promise((r) => setTimeout(r, m.settleMs ?? 100));
+      return { usedRef, usedSelector, x, y };
     },
     getHtml: (m) => {
       const { el, usedRef, usedSelector } = m.ref || m.selector ? resolve(m) : { el: document.documentElement };

@@ -133,8 +133,8 @@ test('a content-script error (e.g. stale ref) surfaces as that error code, not p
 test('an unimplemented method is a clean unsupported error, not a silent no-op', async () => {
   const bg = makeBackground(makeEnv().env);
   await assert.rejects(
-    () => bg.dispatch('tool.upload', { session_id: 's1' }),
-    (e) => e.code === 'unsupported' && /tool\.upload/.test(e.message),
+    () => bg.dispatch('tool.download', { session_id: 's1' }),
+    (e) => e.code === 'unsupported' && /tool\.download/.test(e.message),
   );
 });
 
